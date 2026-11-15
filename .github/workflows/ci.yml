@@ -1,0 +1,21 @@
+# Build + correctness tests (ASan/UBSan) + cold-expert CPU benchmark on every push.
+# Runner numbers are a sanity check only: a 4-vCPU cloud VM is not the E5-2690 v4 host.
+name: ci
+on: [push, workflow_dispatch]
+
+jobs:
+  test-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python plan.py > /dev/null
+      - run: make -C kernels test
+      - run: make -C kernels bench_bfp
+      - name: bench
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)" > bench.txt
+          echo "ISA: $(grep -o -w -E 'avx2|fma|avx512f|avx512_vnni' /proc/cpuinfo | sort -u | tr '\n' ' ')" >> bench.txt
+          for p in qwen3-30b-a3b qwen3-next-80b gpt-oss-120b glm-4.5-air; do
+            for f in bfp4 bfp8; do OMP_NUM_THREADS=$(nproc) ./kernels/bench_bfp $p $f 2048 400 | tee -a bench.txt; done
+          done
+          { echo '```'; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
