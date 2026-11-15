@@ -80,8 +80,10 @@ def memory_map(dense_fmt="bfp8", expert_fmt="bfp4", ctx=32768, host=None):
                 ngram_in_ram=free >= ngram if host else None)
 
 
-def decode(host, hit=None, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096):
-    """Tokens/s. hit = share of activated routed experts that are on the card (None = uniform routing)."""
+def decode(host, hit=None, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096, promote=0):
+    """Tokens/s. hit = share of activated routed experts that are on the card (None = uniform routing).
+    promote = experts copied host -> card per token by an adaptive cache; the DMA overlaps compute, but its reads
+    share host DRAM bandwidth with the cold experts, and the link must finish them within the token."""
     p, m = params(), QFN
     mm = memory_map(dense_fmt, expert_fmt, ctx, host)
     h = mm["f"] if hit is None else hit
@@ -89,15 +91,16 @@ def decode(host, hit=None, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096):
     tok_experts = m["L"] * m["k"] * mm["eb"]
     t_dense = (mm["dense"] + mm["kv"] + mm["state"]) / dev_bw
     t_hot = h * tok_experts / dev_bw
-    t_cold = (1 - h) * tok_experts / cpu_bw
+    t_cold = ((1 - h) * tok_experts + promote * mm["eb"]) / cpu_bw
     t_pcie = m["L"] * (PCIE_RT_US * 1e-6 + 2 * m["d"] * 2 / (PCIE * PCIE_EFF))
-    return 1 / (t_dense + max(t_hot, t_cold + t_pcie)), dict(dense=t_dense, hot=t_hot, cold=t_cold, pcie=t_pcie)
+    t = max(t_dense + max(t_hot, t_cold + t_pcie), t_pcie + promote * mm["eb"] / (PCIE * PCIE_EFF))
+    return 1 / t, dict(dense=t_dense, hot=t_hot, cold=t_cold, pcie=t_pcie)
 
 
 DRAFT_VOCAB = 106_299   # ponytail: Basalt's convert/draft_vocab.bin read as int32 ids; replace with the real count
 
 
-def decode_mtp(host, hot, cold, m, accepted, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096):
+def decode_mtp(host, hot, cold, m, accepted, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096, promote=0):
     """Tokens/s with MTP speculative decoding. Each step drafts m-1 tokens with the MTP layer, then verifies m tokens
     in one pass, so the card reads its dense weights once per step instead of once per token.
     hot, cold: routed experts per layer that the m tokens need together, on the card and on the CPU (measured by
@@ -108,14 +111,15 @@ def decode_mtp(host, hot, cold, m, accepted, dense_fmt="bfp8", expert_fmt="bfp4"
     # ponytail: card compute ignored; m <= 8 tokens stays bandwidth-bound on 120 Tensix cores
     t_dense = (mm["dense"] + mm["kv"] * m + mm["state"]) / dev_bw
     t_hot = q["L"] * hot * mm["eb"] / dev_bw
-    t_cold = q["L"] * cold * mm["eb"] / cpu_bw
+    t_cold = (q["L"] * cold + promote) * mm["eb"] / cpu_bw         # promote: adaptive-cache copies per step
     t_pcie = q["L"] * (PCIE_RT_US * 1e-6 + 2 * m * q["d"] * 2 / (PCIE * PCIE_EFF))
     # one draft token: the MTP layer (full attention, shared expert, router, hyper-connections, two d x d input
     # projections, draft head over the reduced vocabulary) on the card, its 10 routed experts on the CPU
     mtp_dense = (p["attn_full"] + 3 * q["d"] * q["S"] + q["d"] * q["E"] + p["hc"] / q["L"] + 2 * q["d"] ** 2
                  + DRAFT_VOCAB * q["d"]) * b
     t_draft = mtp_dense / dev_bw + q["k"] * mm["eb"] / cpu_bw + PCIE_RT_US * 1e-6
-    return accepted / (t_dense + max(t_hot, t_cold + t_pcie) + (m - 1) * t_draft)
+    t = t_dense + max(t_hot, t_cold + t_pcie) + (m - 1) * t_draft
+    return accepted / max(t, t_pcie + promote * mm["eb"] / (PCIE * PCIE_EFF))
 
 
 def report():

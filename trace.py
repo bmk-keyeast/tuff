@@ -6,11 +6,13 @@ Uses transformers' own Qwen4Exp modules, built on the meta device. Each decoder 
 HTTP range requests just before it runs and dropped right after, routed experts only for the experts the router
 picked, the N-gram table and the token embeddings only for the rows the text needs. Nothing is written to disk.
 
-The batch holds every (expert format, text) pair, so one pass over the weights measures all of them:
-  bf16    reference (checkpoint precision; dense weights run in fp32)
-  bfp4    every routed expert in TT bfp4_b
-  bfp4+8  gate/up in bfp4_b, down in bfp8_b
-and, from the bf16 rows, the routing trace: which experts each token uses at each layer.
+The batch holds every (format, text) pair, so one pass over the weights measures all of them:
+  bf16       reference (checkpoint precision; dense weights run in fp32)
+  bfp4       routed experts in TT bfp4_b, dense weights as in the checkpoint
+  tuff       tuff's default card: dense projections and LM head in bfp8_b, routed experts in bfp4_b
+  tuff-fast  dense projections in bfp4_b, LM head bfp8_b, routed experts bfp4_b
+(router, norms, convolutions and the 1- and 4-row gates stay unquantized), and, from the bf16 rows, the routing
+trace: which experts each token uses at each layer.
 
 Outputs: perplexity of each format (the bf16 one checks this harness against the published model), KL divergence and
 top-1 agreement against bf16, routing statistics, and how often a token's experts would be on the card for a given
@@ -30,7 +32,8 @@ from loader import Source
 
 REPO_ID = "Qwen/Qwen3.8-Flash-Next"
 CK = "model.language_model."                  # checkpoint prefix of the text model
-FORMATS = {"bf16": (None, None), "bfp4": (3, 3), "bfp4+8": (3, 7)}   # mantissa bits for (gate_up, down)
+FORMATS = {"bf16": (None, None, None), "bfp4": (None, 3, 3), "tuff": (7, 3, 3), "tuff-fast": (3, 3, 3)}
+# mantissa bits for (dense projections, expert gate_up, expert down); None = unquantized. LM head: bfp8 when dense is.
 DT = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16, "I64": torch.int64, "I32": torch.int32}
 ROOT = Path(__file__).parent
 
@@ -112,7 +115,30 @@ def materialize(src, module, ck_prefix, skip=()):
             put(module, n, t)
 
 
+def split_linears(module, row_bits):
+    """Every nn.Linear in `module` (dense projections; the routed experts are not nn.Linear) gets one weight per
+    format: batch row b multiplies by its weight quantized to row_bits[b] (None = as loaded). Layers whose shape is
+    not whole 16-row blocks (the 1- and 4-output gates) stay unquantized."""
+    n_rows = len(row_bits)
+    for lin in module.modules():
+        if not isinstance(lin, torch.nn.Linear) or lin.out_features % 16 or lin.in_features % 8:
+            continue
+        assert lin.bias is None
+        groups = [(torch.tensor([b for b in range(n_rows) if row_bits[b] == bits]),
+                   lin.weight if bits is None else bfp(lin.weight, bits)) for bits in set(row_bits)]
+
+        def forward(x, groups=groups, out=lin.out_features):
+            xb = x.reshape(n_rows, -1, x.shape[-1])
+            y = x.new_empty(n_rows, xb.shape[1], out)
+            for rows, w in groups:
+                y[rows] = F.linear(xb[rows], w)
+            return y.reshape(*x.shape[:-1], out)
+        lin.forward = forward
+
+
 def release(module):
+    for lin in module.modules():
+        lin.__dict__.pop("forward", None)               # split_linears' quantized copies
     for n, t in list(module.named_parameters()) + list(module.named_buffers()):
         if t.device.type != "meta":
             put(module, n, torch.empty(t.shape, dtype=t.dtype, device="meta"))
@@ -204,11 +230,13 @@ def main():
         if layer.ple is not None:
             emb = layer.ple.ple_embedding
             emb.ngram_embedding = NGramRows(src, f"{CK}layers.{L}.ple.ple_embedding.ngram_embedding")
-        layer.mlp.experts.forward = make_experts_forward(src, L, fmt_of_row, list(FORMATS.values()), stats)
+        layer.mlp.experts.forward = make_experts_forward(src, L, fmt_of_row, [(g, d) for _, g, d in FORMATS.values()],
+                                                         stats)
 
         def pre(mod, args, L=L):
             t0 = time.time()
             materialize(src, mod, f"{CK}layers.{L}.", skip=("mlp.experts.", "ple.ple_embedding.ngram_embedding."))
+            split_linears(mod, [FORMATS[fmts[b // C]][0] for b in range(Fn * C)])
             mod._t = (time.time(), time.time() - t0, stats["fetch_s"], stats["experts"])
 
         def post(mod, args, out, L=L):
@@ -230,11 +258,13 @@ def main():
                ids=ids.numpy(), timing=np.array(timing))
     if full:
         W = tensor(src, "lm_head.weight")
+        W8 = torch.cat([bfp(W[i:i + 16384], 7) for i in range(0, W.shape[0], 16384)])   # chunks: bounded temporaries
+        Wf = [W if FORMATS[f][0] is None else W8 for f in fmts]         # LM head bfp8 wherever dense is quantized
         metrics = np.zeros((Fn, C, 3))                                   # nll, kld, top-1 agreement (sums)
         for c in range(C):
             for t0 in range(0, T - 1, 128):
                 t1 = min(t0 + 128, T - 1)
-                lp = torch.log_softmax(h[[f * C + c for f in range(Fn)], t0:t1] @ W.T, dim=-1)   # [Fn, t, V]
+                lp = torch.log_softmax(torch.stack([h[f * C + c, t0:t1] @ Wf[f].T for f in range(Fn)]), dim=-1)
                 tgt = ids[c, t0 + 1:t1 + 1]
                 for f in range(Fn):
                     metrics[f, c, 0] -= lp[f, torch.arange(t1 - t0), tgt].sum().item()
@@ -256,6 +286,30 @@ def basalt_order(path, E):
     _, _, _, n, _ = struct.unpack("<5I", d[:20])
     p = np.frombuffer(d[20:20 + 4 * n], "<u2").reshape(n, 2).astype(np.int64)
     return p[:, 0] * E + p[:, 1]
+
+
+def simulate_cache(seq, n, budget, init, LE):
+    """Hit rate of an adaptive card cache on a routing trace. seq: [T, L, k] global expert ids in decode order.
+    The card starts with init[:n]. A routed expert that is not on the card runs on the CPU for that token and is
+    queued; after each token up to `budget` of its misses are copied to the card (PCIe DMA overlapping the next
+    token), evicting the least recently used experts. Returns (hit rate, mean copies per token)."""
+    res = np.zeros(LE, bool)
+    res[init[:n]] = True
+    last = np.full(LE, -np.inf)
+    last[init[:n]] = -1.0 - np.arange(n)                # better-ranked counts as more recently used
+    hits = copies = 0
+    for t, r in enumerate(seq):
+        ids = r.ravel()
+        on = res[ids]
+        hits += on.sum()
+        last[ids] = t
+        miss = np.unique(ids[~on])[:budget]             # ponytail: any `budget` of the misses; all were just used
+        if len(miss):
+            cand = np.flatnonzero(res)
+            victims = cand[np.argpartition(last[cand], len(miss))[:len(miss)]]
+            res[victims], res[miss] = False, True
+            copies += len(miss)
+    return hits / seq.size, copies / len(seq)
 
 
 def analyze(prof=None):
@@ -316,6 +370,25 @@ def analyze(prof=None):
         same = np.mean([len(set(R[l, 0, c, t]) & set(R[l, f, c, t])) / k
                         for l in range(L) for c in range(C) for t in range(T)])
         out.append(f"With {fmts[f]} experts, {same:.1%} of the routed experts are the same as with bf16.")
+    if prof:
+        n8 = caps["bfp8"]
+        b = orders["Basalt's shipped profile"](0)
+        seqs = {name: flat[:, c].transpose(1, 0, 2) for c, name in enumerate(chunks)}       # [T, L, k]
+        if C > 1:
+            seqs[" then ".join(chunks)] = np.concatenate(list(seqs.values()))               # a change of topic
+        budgets = (0, 10, 25, 50, 100)
+        out += ["\n### Adaptive card cache (simulated on the trace)\n",
+                f"{n8:,} experts on the card (dense BFP8), starting from Basalt's profile. A miss runs on the CPU and the "
+                "expert is copied to the card for the next token, evicting the least recently used; 'copies' caps the "
+                "copies per token (0 = static placement). t/s from plan.py, which charges the copies to host DRAM "
+                "bandwidth and to the PCIe 3.0 link (E5-2690 v4, dense BFP8, no MTP).\n",
+                "| Text | " + " | ".join(f"{x} copies" for x in budgets) + " |", "|---|" + "---:|" * len(budgets)]
+        for name, s in seqs.items():
+            cells = []
+            for bud in budgets:
+                h, cp = simulate_cache(s, n8, bud, b, L * E)
+                cells.append(f"{h:.1%} ({plan.decode(host, h, 'bfp8', promote=cp)[0]:.1f} t/s)")
+            out.append(f"| {name} | " + " | ".join(cells) + " |")
     # MTP verification runs m consecutive tokens through each layer at once: weights are read once per step, so what
     # matters is the union of their experts (card-resident and cold), measured here on the real routing.
     if prof:
@@ -340,6 +413,22 @@ def analyze(prof=None):
             hot, cold = (np.interp(m, ms, [win[x][i] for x in ms]) for i in (1, 2))
             r = [plan.decode_mtp(host, hot, cold, m, 1 + dl * acc, d) for d in ("bfp8", "bfp4")]
             out.append(f"| {kind} | {dl} | {1 + dl * acc:.2f} | {r[0]:.1f} t/s | {r[1]:.1f} t/s |")
+        # everything together: adaptive cache (25 copies per token) + MTP, on the topic-change sequence
+        mix = seqs[" then ".join(chunks)] if C > 1 else seqs[chunks[0]]
+        out += ["\n### Predicted decode: adaptive cache + MTP\n",
+                f"Adaptive cache with up to 25 copies per token, hit rate measured on '{' then '.join(chunks)}'; MTP "
+                "as above, with each step's union of experts split by that hit rate. Batch 1, 4k context.\n",
+                "| Host | Dense on card | Hit rate | no MTP | prose | chat | structured |", "|---|---|---:|---:|---:|---:|---:|"]
+        for hn in ("E5-2690v4, 4x16GB", "8259CL, 6x32GB"):
+            hh = plan.HOSTS[hn]
+            for d in ("bfp8", "bfp4"):
+                hr, cp = simulate_cache(mix, caps[d], 25, b, L * E)
+                cells = [f"{plan.decode(hh, hr, d, promote=cp)[0]:.1f}"]
+                for kind, (dl, acc) in scen.items():
+                    m = 1 + dl
+                    u = np.interp(m, ms, [win[x][0] for x in ms])
+                    cells.append(f"{plan.decode_mtp(hh, u * hr, u * (1 - hr), m, 1 + dl * acc, d, promote=cp * (1 + dl * acc)):.1f}")
+                out.append(f"| {hn} | {d} | {hr:.1%} | " + " | ".join(cells) + " |")
     if prof and "metrics" in z:
         key = ("Basalt's shipped profile", chunks[0])
         out += ["\n### Predicted decode with the measured hit rate\n",
