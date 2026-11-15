@@ -1,41 +1,27 @@
-Batch-1 decode, 4096-token context. Experts bfp4, everything else bfp8 on the card. Uniform routing (no expert-popularity skew). Efficiencies: card 43%, DRAM 70%, PCIe 80%, 30 us PCIe round trip per MoE layer.
+## Qwen3.8-Flash-Next on p150a + Xeon
 
+Parameters (this count): main model 125.7B (published: ~125B), active per token 7.3B (published: ~6B; ours includes embedding and LM head), N-gram embeddings 51.2B (published: ~51B), routed experts 24,576 x 4.92M params.
 
-### E5-2690v4 64GB (DRAM 68 GB/s peak, PCIe 3.0 x16)
+### Memory map (32k context)
 
-| Model | Params (B) | Experts on card | Host RAM for experts (GB) | Fits | CPU-only t/s | Stream-to-card t/s | **Hybrid t/s** | Hybrid time split: dense / hot / cold+PCIe (ms) |
-|---|---:|---:|---:|:-:|---:|---:|---:|---|
-| Qwen3-30B-A3B | 30.5 | 6144/6144 (100%) | 0.6 | yes | 18.8 | 86.7 | **86.7** | 6.9 / 4.6 / 1.5 |
-| Qwen3-Next-80B-A3B | 79.0 | 17231/24576 (70%) | 13.6 | yes | 18.6 | 32.6 | **68.5** | 7.8 / 2.7 / 6.8 |
-| gpt-oss-20b | 20.9 | 768/768 (100%) | 1.2 | yes | 17.4 | 80.2 | **80.2** | 6.4 / 6.1 / 0.7 |
-| gpt-oss-120b | 116.8 | 2172/4608 (47%) | 35.3 | yes | 12.5 | 10.3 | **31.6** | 8.2 / 4.3 / 23.4 |
-| GLM-4.5-Air | 106.9 | 2550/5760 (44%) | 32.5 | yes | 4.4 | 5.1 | **13.2** | 33.6 / 7.0 / 42.3 |
-| DeepSeek-V2-Lite | 15.8 | 1664/1664 (100%) | 0.4 | yes | 19.1 | 88.2 | **88.2** | 7.9 / 3.4 / 0.8 |
-| Mixtral-8x7B | 46.7 | 256/256 (100%) | 0.3 | yes | 5.8 | 26.9 | **26.9** | 8.4 / 28.8 / 1.0 |
-| Qwen3-235B-A22B | 235.1 | 2256/12032 (19%) | 105.0 | no | 2.9 | 1.8 | **5.7** | 37.5 / 6.8 / 138.7 |
+| Host | Dense on card | Routed experts on card | Cold experts + embeddings + MTP experts in host RAM | Fits | N-gram table (28.8 GB) |
+|---|---|---:|---:|:-:|---|
+| E5-2690v4, 4x16GB | bfp8, 4.5 GB | 9,815 / 24,576 (40%) | 43.5 GB | yes | NVMe (mmap) |
+| E5-2690v4, 4x16GB | bfp4, 2.4 GB | 10,586 / 24,576 (43%) | 41.4 GB | yes | NVMe (mmap) |
+| E5-2690v4, 128GB | bfp8, 4.5 GB | 9,815 / 24,576 (40%) | 43.5 GB | yes | host RAM |
+| E5-2690v4, 128GB | bfp4, 2.4 GB | 10,586 / 24,576 (43%) | 41.4 GB | yes | host RAM |
+| 8259CL, 6x32GB | bfp8, 4.5 GB | 9,815 / 24,576 (40%) | 43.5 GB | yes | host RAM |
+| 8259CL, 6x32GB | bfp4, 2.4 GB | 10,586 / 24,576 (43%) | 41.4 GB | yes | host RAM |
 
-### E5-2690v4 128GB (DRAM 68 GB/s peak, PCIe 3.0 x16)
+### Decode speed, batch 1, 4k context, experts BFP4
 
-| Model | Params (B) | Experts on card | Host RAM for experts (GB) | Fits | CPU-only t/s | Stream-to-card t/s | **Hybrid t/s** | Hybrid time split: dense / hot / cold+PCIe (ms) |
-|---|---:|---:|---:|:-:|---:|---:|---:|---|
-| Qwen3-30B-A3B | 30.5 | 6144/6144 (100%) | 0.6 | yes | 18.8 | 86.7 | **86.7** | 6.9 / 4.6 / 1.5 |
-| Qwen3-Next-80B-A3B | 79.0 | 17231/24576 (70%) | 13.6 | yes | 18.6 | 32.6 | **68.5** | 7.8 / 2.7 / 6.8 |
-| gpt-oss-20b | 20.9 | 768/768 (100%) | 1.2 | yes | 17.4 | 80.2 | **80.2** | 6.4 / 6.1 / 0.7 |
-| gpt-oss-120b | 116.8 | 2172/4608 (47%) | 35.3 | yes | 12.5 | 10.3 | **31.6** | 8.2 / 4.3 / 23.4 |
-| GLM-4.5-Air | 106.9 | 2550/5760 (44%) | 32.5 | yes | 4.4 | 5.1 | **13.2** | 33.6 / 7.0 / 42.3 |
-| DeepSeek-V2-Lite | 15.8 | 1664/1664 (100%) | 0.4 | yes | 19.1 | 88.2 | **88.2** | 7.9 / 3.4 / 0.8 |
-| Mixtral-8x7B | 46.7 | 256/256 (100%) | 0.3 | yes | 5.8 | 26.9 | **26.9** | 8.4 / 28.8 / 1.0 |
-| Qwen3-235B-A22B | 235.1 | 2256/12032 (19%) | 105.0 | yes | 2.9 | 1.8 | **5.7** | 37.5 / 6.8 / 138.7 |
+Efficiencies: card 43% of 512 GB/s, DRAM 70% of peak, PCIe 80%, 30 us round trip per layer. 'Card hit rate' = share of the 10 activated experts per layer found on the card. Uniform routing gives the share of experts that fit; a measured popularity profile (Basalt ships one) raises it. MTP speculative decoding is not included.
 
-### 8259CL 192GB (DRAM 141 GB/s peak, PCIe 3.0 x16)
-
-| Model | Params (B) | Experts on card | Host RAM for experts (GB) | Fits | CPU-only t/s | Stream-to-card t/s | **Hybrid t/s** | Hybrid time split: dense / hot / cold+PCIe (ms) |
-|---|---:|---:|---:|:-:|---:|---:|---:|---|
-| Qwen3-30B-A3B | 30.5 | 6144/6144 (100%) | 0.6 | yes | 38.8 | 86.7 | **86.7** | 6.9 / 4.6 / 1.5 |
-| Qwen3-Next-80B-A3B | 79.0 | 17231/24576 (70%) | 13.6 | yes | 38.3 | 32.6 | **84.3** | 7.8 / 2.7 / 4.0 |
-| gpt-oss-20b | 20.9 | 768/768 (100%) | 1.2 | yes | 35.9 | 80.2 | **80.2** | 6.4 / 6.1 / 0.7 |
-| gpt-oss-120b | 116.8 | 2172/4608 (47%) | 35.3 | yes | 25.8 | 10.3 | **49.7** | 8.2 / 4.3 / 11.9 |
-| GLM-4.5-Air | 106.9 | 2550/5760 (44%) | 32.5 | yes | 9.0 | 5.1 | **18.2** | 33.6 / 7.0 / 21.2 |
-| DeepSeek-V2-Lite | 15.8 | 1664/1664 (100%) | 0.4 | yes | 39.5 | 88.2 | **88.2** | 7.9 / 3.4 / 0.8 |
-| Mixtral-8x7B | 46.7 | 256/256 (100%) | 0.3 | yes | 12.0 | 26.9 | **26.9** | 8.4 / 28.8 / 1.0 |
-| Qwen3-235B-A22B | 235.1 | 2256/12032 (19%) | 105.0 | yes | 6.1 | 1.8 | **9.4** | 37.5 / 6.8 / 68.8 |
+| Host | Dense format | uniform routing | 60% hits | 80% hits | time split at uniform: dense / hot / cold+PCIe (ms) |
+|---|---|---:|---:|---:|---|
+| E5-2690v4, 4x16GB | bfp8 | 25.4 t/s | 29.5 | 35.2 | 21.4 / 2.4 / 18.0 |
+| E5-2690v4, 4x16GB | bfp4 | 34.7 t/s | 41.2 | 53.5 | 11.7 / 2.6 / 17.1 |
+| E5-2690v4, 128GB | bfp8 | 25.4 t/s | 29.5 | 35.2 | 21.4 / 2.4 / 18.0 |
+| E5-2690v4, 128GB | bfp4 | 34.7 t/s | 41.2 | 53.5 | 11.7 / 2.6 / 17.1 |
+| 8259CL, 6x32GB | bfp8 | 32.4 t/s | 35.4 | 38.2 | 21.4 / 2.4 / 9.5 |
+| 8259CL, 6x32GB | bfp4 | 48.2 t/s | 54.0 | 60.7 | 11.7 / 2.6 / 9.1 |

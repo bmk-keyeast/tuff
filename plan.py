@@ -1,135 +1,152 @@
-"""Expert-placement planner for MoE decode on one Blackhole p150a + a DDR4 Xeon host.
+"""Memory map and decode-time model for Qwen3.8-Flash-Next (QFN) on one Blackhole p150a + a DDR4 Xeon host.
 
-Split per decoder layer (batch-1 decode):
-    device (p150a): attention, router, shared/dense MLPs, LM head, KV cache, and as many routed
-                    experts as fit in the remaining GDDR6 ("hot" experts)
-    host CPU:       every other routed expert, computed in place from DRAM ("cold" experts)
-    PCIe:           only the hidden-state vector crosses the bus (to the host and back), never weights
+Placement (batch-1 decode):
+    p150a GDDR6:  attention (36 Gated-DeltaNet + 12 full-attention layers), router, shared expert,
+                  hyper-connection mixers, LM head, KV cache / recurrent state, and as many routed
+                  experts as fit ("hot")
+    host DRAM:    every other routed expert, computed in place by the CPU ("cold"), token embeddings,
+                  the MTP drafter's experts; the 51B N-gram embedding table too when RAM allows
+    NVMe:         the N-gram table otherwise (memory-mapped, as Strata does); a few rows per token
+    PCIe 3.0:     hidden-state vectors only, never weights
 
-    t_token = t_dense_dev + max(t_hot_dev, t_cold_cpu + t_pcie)
-
-The alternative of streaming cold experts over PCIe to the card is modeled as well, because it shows
-why the CPU path wins on this host: PCIe 3.0 x16 (~13 GB/s) is far slower than 4-6 channel DDR4.
+    t_token = t_dense + max(t_hot, t_cold + t_pcie)
 
     python plan.py        -> results/plan.md
 """
 from pathlib import Path
 
-GB = 1e9
-GiB = 2**30
+GB, GiB = 1e9, 2**30
 B = {"bf16": 2.0, "bfp8": 1088 / 1024, "bfp4": 576 / 1024}   # bytes/param, TT block-float formats
 
-DEVICE = dict(name="p150a", mem=32 * GiB, reserve=2 * GiB, bw=512 * GB,
-              # calibrated in bmk-keyeast/blackhole-llm: published Llama 3.1 8B p150 decode = 43% of peak
-              eff=0.43)
+# Qwen/Qwen3.8-Flash-Next config.json (text_config, model_type qwen4_exp_text)
+QFN = dict(d=2560, L=48, full_every=4,                       # layer_types: 3 linear_attention : 1 full_attention
+           H=24, KV=2, hd=256,                               # full attention, sigmoid output gate
+           idx_heads=4, idx_hd=128, idx_kv=1,                # sparse-attention indexer (budget 2048)
+           lin_k_heads=16, lin_v_heads=48, lin_hd=128, conv=4,  # Gated DeltaNet
+           E=512, k=10, I=640, S=640,                        # routed experts, top-10, shared expert
+           hc=4, hc_rank=320,                                # hyper-connections: 4 residual streams
+           V=248320, ngram_rows=20_000_000)                  # vocab, ngram_vocab_size_base
 
+
+def params(m=QFN):
+    """Parameter counts per placement class. Full/linear attention follow the Qwen3-Next layout;
+    hyper-connection mixers are approximated as two low-rank 4-stream mixers per layer (<1% of the model)."""
+    d, L = m["d"], m["L"]
+    n_full = L // m["full_every"]
+    n_lin = L - n_full
+    full = (d * m["H"] * m["hd"] * 2                      # q + output gate
+            + 2 * d * m["KV"] * m["hd"] + m["H"] * m["hd"] * d
+            + d * (m["idx_heads"] + m["idx_kv"]) * m["idx_hd"])
+    kd, vd = m["lin_k_heads"] * m["lin_hd"], m["lin_v_heads"] * m["lin_hd"]
+    lin = d * (2 * kd + 2 * vd) + d * 2 * m["lin_v_heads"] + vd * d + (2 * kd + vd) * m["conv"]
+    hc = 2 * 2 * (m["hc"] * d * m["hc_rank"])
+    expert = 3 * d * m["I"]
+    return dict(attn=n_full * full + n_lin * lin, shared=L * 3 * d * m["S"], router=L * d * m["E"], hc=L * hc,
+                lm_head=m["V"] * d, embed=m["V"] * d, ngram=m["ngram_rows"] * d,
+                expert=expert, n_experts=L * m["E"], mtp_experts=m["E"] * expert,
+                n_full=n_full, n_lin=n_lin)
+
+
+DEVICE = dict(mem=32 * GiB, reserve=2 * GiB, bw=512 * GB,
+              eff=0.43)   # calibrated in bmk-keyeast/blackhole-llm (published Llama 3.1 8B p150 decode)
 HOSTS = {
-    # E5-2690 v4 (Broadwell-EP): 14C/28T, AVX2+FMA, 4ch DDR4-2133 RDIMM, PCIe 3.0 x16 to the card
-    "E5-2690v4 64GB": dict(ram=64 * GiB, bw=4 * 2133e6 * 8, pcie=15.75 * GB),
-    "E5-2690v4 128GB": dict(ram=128 * GiB, bw=4 * 2133e6 * 8, pcie=15.75 * GB),
-    # Xeon Platinum 8259CL (Cascade Lake, LGA3647): 24C, AVX-512 VNNI, 6ch DDR4-2933, still PCIe 3.0.
-    # Capacity is an assumption (6 x 32 GB); change it to the real build.
-    "8259CL 192GB": dict(ram=192 * GiB, bw=6 * 2933e6 * 8, pcie=15.75 * GB),
+    # Xeon E5-2690 v4: 14C/28T Broadwell-EP, AVX2+FMA, 4 x DDR4-2133 ECC RDIMM (4 channels), PCIe 3.0 x16
+    "E5-2690v4, 4x16GB": dict(ram=64 * GiB, bw=4 * 2133e6 * 8),
+    "E5-2690v4, 128GB": dict(ram=128 * GiB, bw=4 * 2133e6 * 8),
+    # Xeon Platinum 8259CL (LGA3647): 24C Cascade Lake, AVX-512 VNNI, 6 x DDR4-2933, still PCIe 3.0.
+    # Capacity is an assumption (6 x 32 GB).
+    "8259CL, 6x32GB": dict(ram=192 * GiB, bw=6 * 2933e6 * 8),
 }
-# ponytail: one efficiency knob per link. STREAM on 2-socket Broadwell/Cascade Lake typically reaches
-# ~70-80% of peak per socket; PCIe 3.0 x16 DMA ~80%. Replace with numbers from bench/ on the real box.
-CPU_EFF, PCIE_EFF = 0.70, 0.80
-PCIE_RT_US = 30.0     # ponytail: host<->device round trip per layer, unknown until measured on the card
-HOST_RESERVE = 6 * GiB  # OS, runtime, page cache, KV for prefill staging
-
-# From each model's HF config.json. d=hidden, L=layers, H/KV/hd=attention, E=routed experts,
-# k=experts per token, I=expert intermediate, S=shared-expert intermediate total, Dk/DI=leading dense
-# layers and their MLP width, V=vocab.
-MODELS = {
-    "Qwen3-30B-A3B":     dict(d=2048, L=48, H=32, KV=4, hd=128, E=128, k=8,  I=768,  S=0,    Dk=0, DI=0,     V=151936),
-    "Qwen3-Next-80B-A3B": dict(d=2048, L=48, H=16, KV=2, hd=256, E=512, k=10, I=512,  S=512,  Dk=0, DI=0,     V=151936),
-    "gpt-oss-20b":       dict(d=2880, L=24, H=64, KV=8, hd=64,  E=32,  k=4,  I=2880, S=0,    Dk=0, DI=0,     V=201088),
-    "gpt-oss-120b":      dict(d=2880, L=36, H=64, KV=8, hd=64,  E=128, k=4,  I=2880, S=0,    Dk=0, DI=0,     V=201088),
-    "GLM-4.5-Air":       dict(d=4096, L=46, H=96, KV=8, hd=128, E=128, k=8,  I=1408, S=1408, Dk=1, DI=10944, V=151552),
-    "DeepSeek-V2-Lite":  dict(d=2048, L=27, H=16, KV=16, hd=128, E=64, k=6,  I=1408, S=2816, Dk=1, DI=10944, V=102400),
-    "Mixtral-8x7B":      dict(d=4096, L=32, H=32, KV=8, hd=128, E=8,   k=2,  I=14336, S=0,   Dk=0, DI=0,     V=32000),
-    "Qwen3-235B-A22B":   dict(d=4096, L=94, H=64, KV=4, hd=128, E=128, k=8,  I=1536, S=0,    Dk=0, DI=0,     V=151936),
-}
-# Not modeled exactly (documented upper bounds): DeepSeek MLA and Qwen3-Next linear-attention layers are
-# counted as plain GQA; gpt-oss expert biases and sliding-window KV savings are ignored.
-
-EXPERT_FMT, DENSE_FMT, KV_FMT = "bfp4", "bfp8", "bfp8"
+PCIE = 15.75 * GB
+# ponytail: one efficiency knob per link, replaced by bench/ numbers on the real box
+CPU_EFF, PCIE_EFF, PCIE_RT_US = 0.70, 0.80, 30.0
+HOST_RESERVE = 6 * GiB
+NGRAM_BYTES_PER_PARAM = 28.8e9 / 51.2e9   # Strata's quantized N-gram shard: 28.8 GB for 51.2B params
 
 
-def parts(m):
-    """Parameter counts by placement class."""
-    moe_layers = m["L"] - m["Dk"]
-    attn = m["L"] * (m["d"] * (m["H"] + 2 * m["KV"]) * m["hd"] + m["H"] * m["hd"] * m["d"])
-    dense = moe_layers * m["d"] * m["E"] + moe_layers * 3 * m["d"] * m["S"] + m["Dk"] * 3 * m["d"] * m["DI"]
-    expert = 3 * m["d"] * m["I"]
-    return dict(attn=attn, dense=dense, lm_head=m["V"] * m["d"], embed=m["V"] * m["d"],
-                expert=expert, n_experts=moe_layers * m["E"], moe_layers=moe_layers)
-
-
-def plan(m, host, ctx=4096):
-    p = parts(m)
-    kv = 2 * m["L"] * m["KV"] * m["hd"] * B[KV_FMT] * ctx
-    dev_fixed = (p["attn"] + p["dense"] + p["lm_head"]) * B[DENSE_FMT] + kv
-    eb = p["expert"] * B[EXPERT_FMT]
-    room = DEVICE["mem"] - DEVICE["reserve"] - dev_fixed
+def memory_map(dense_fmt="bfp8", expert_fmt="bfp4", ctx=32768, host=None):
+    p, m = params(), QFN
+    dense = (p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"]) * B[dense_fmt]
+    kv = 2 * p["n_full"] * m["KV"] * m["hd"] * B["bfp8"] * ctx
+    state = p["n_lin"] * m["lin_v_heads"] * m["lin_hd"] * m["lin_hd"] * 4   # fp32 recurrent state
+    eb = p["expert"] * B[expert_fmt]
+    room = DEVICE["mem"] - DEVICE["reserve"] - dense - kv - state
     n_dev = max(0, min(p["n_experts"], int(room // eb)))
-    f = n_dev / p["n_experts"]               # uniform routing: P(an activated expert is on the card)
-    host_bytes = (p["n_experts"] - n_dev) * eb + p["embed"] * B["bf16"]
-    fits = room > 0 and host_bytes <= host["ram"] - HOST_RESERVE
-
-    tok_expert_bytes = p["moe_layers"] * m["k"] * eb
-    kv_read = kv  # full context read once per token
-    dev_bw, cpu_bw, pcie_bw = DEVICE["bw"] * DEVICE["eff"], host["bw"] * CPU_EFF, host["pcie"] * PCIE_EFF
-    t_dense = ((p["attn"] + p["dense"] + p["lm_head"]) * B[DENSE_FMT] + kv_read) / dev_bw
-    t_hot = f * tok_expert_bytes / dev_bw
-    t_cold = (1 - f) * tok_expert_bytes / cpu_bw
-    t_pcie = p["moe_layers"] * (PCIE_RT_US * 1e-6 + 2 * m["d"] * 2 / pcie_bw)
-    hybrid = t_dense + max(t_hot, t_cold + t_pcie)
-    stream = t_dense + t_hot + (1 - f) * tok_expert_bytes / pcie_bw          # fetch cold experts to the card
-    active = (p["attn"] + p["dense"] + p["lm_head"]) * B[DENSE_FMT] + kv_read + tok_expert_bytes
-    cpu_only = active / cpu_bw
-    total = (p["attn"] + p["dense"] + p["lm_head"] + p["n_experts"] * p["expert"] + p["embed"])
-    return dict(total_params=total, dev_fixed=dev_fixed, n_dev=n_dev, n_exp=p["n_experts"], f=f,
-                host_bytes=host_bytes, fits=fits, hybrid=1 / hybrid, stream=1 / stream, cpu_only=1 / cpu_only,
-                t_dense=t_dense, t_hot=t_hot, t_cold=t_cold, t_pcie=t_pcie)
+    host_need = (p["n_experts"] - n_dev) * eb + p["embed"] * B["bf16"] + p["mtp_experts"] * B[expert_fmt]
+    ngram = p["ngram"] * NGRAM_BYTES_PER_PARAM
+    free = host["ram"] - HOST_RESERVE - host_need if host else 0
+    return dict(dense=dense, kv=kv, state=state, eb=eb, n_dev=n_dev, f=n_dev / p["n_experts"], host_need=host_need,
+                ngram=ngram, fits=host_need <= (host["ram"] - HOST_RESERVE) if host else None,
+                ngram_in_ram=free >= ngram if host else None)
 
 
-def table(ctx=4096):
-    out = [f"Batch-1 decode, {ctx}-token context. Experts {EXPERT_FMT}, everything else {DENSE_FMT} on the card. "
-           f"Uniform routing (no expert-popularity skew). Efficiencies: card {DEVICE['eff']:.0%}, DRAM {CPU_EFF:.0%}, "
-           f"PCIe {PCIE_EFF:.0%}, {PCIE_RT_US:.0f} us PCIe round trip per MoE layer.\n"]
-    for hname, h in HOSTS.items():
-        out += [f"\n### {hname} (DRAM {h['bw'] / GB:.0f} GB/s peak, PCIe 3.0 x16)\n",
-                "| Model | Params (B) | Experts on card | Host RAM for experts (GB) | Fits | CPU-only t/s | Stream-to-card t/s | **Hybrid t/s** | Hybrid time split: dense / hot / cold+PCIe (ms) |",
-                "|---|---:|---:|---:|:-:|---:|---:|---:|---|"]
-        for name, m in MODELS.items():
-            r = plan(m, h, ctx)
-            out.append(f"| {name} | {r['total_params'] / 1e9:.1f} | {r['n_dev']}/{r['n_exp']} ({r['f']:.0%}) | "
-                       f"{r['host_bytes'] / GB:.1f} | {'yes' if r['fits'] else 'no'} | {r['cpu_only']:.1f} | "
-                       f"{r['stream']:.1f} | **{r['hybrid']:.1f}** | {1e3 * r['t_dense']:.1f} / {1e3 * r['t_hot']:.1f} / "
-                       f"{1e3 * (r['t_cold'] + r['t_pcie']):.1f} |")
+def decode(host, hit=None, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096):
+    """Tokens/s. hit = share of activated routed experts that are on the card (None = uniform routing)."""
+    p, m = params(), QFN
+    mm = memory_map(dense_fmt, expert_fmt, ctx, host)
+    h = mm["f"] if hit is None else hit
+    dev_bw, cpu_bw = DEVICE["bw"] * DEVICE["eff"], host["bw"] * CPU_EFF
+    tok_experts = m["L"] * m["k"] * mm["eb"]
+    t_dense = (mm["dense"] + mm["kv"] + mm["state"]) / dev_bw
+    t_hot = h * tok_experts / dev_bw
+    t_cold = (1 - h) * tok_experts / cpu_bw
+    t_pcie = m["L"] * (PCIE_RT_US * 1e-6 + 2 * m["d"] * 2 / (PCIE * PCIE_EFF))
+    return 1 / (t_dense + max(t_hot, t_cold + t_pcie)), dict(dense=t_dense, hot=t_hot, cold=t_cold, pcie=t_pcie)
+
+
+def report():
+    p = params()
+    main = p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"] + p["embed"] + p["n_experts"] * p["expert"]
+    active = (p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"] + p["embed"]
+              + QFN["L"] * QFN["k"] * p["expert"])
+    out = [f"## Qwen3.8-Flash-Next on p150a + Xeon\n",
+           f"Parameters (this count): main model {main / 1e9:.1f}B (published: ~125B), active per token {active / 1e9:.1f}B "
+           f"(published: ~6B; ours includes embedding and LM head), N-gram embeddings {p['ngram'] / 1e9:.1f}B (published: ~51B), "
+           f"routed experts {p['n_experts']:,} x {p['expert'] / 1e6:.2f}M params.\n",
+           "### Memory map (32k context)\n",
+           "| Host | Dense on card | Routed experts on card | Cold experts + embeddings + MTP experts in host RAM | Fits | N-gram table (28.8 GB) |",
+           "|---|---|---:|---:|:-:|---|"]
+    for hn, h in HOSTS.items():
+        for df in ["bfp8", "bfp4"]:
+            mm = memory_map(df, "bfp4", 32768, h)
+            out.append(f"| {hn} | {df}, {mm['dense'] / GB:.1f} GB | {mm['n_dev']:,} / {p['n_experts']:,} ({mm['f']:.0%}) | "
+                       f"{mm['host_need'] / GB:.1f} GB | {'yes' if mm['fits'] else 'no'} | "
+                       f"{'host RAM' if mm['ngram_in_ram'] else 'NVMe (mmap)'} |")
+    out += ["\n### Decode speed, batch 1, 4k context, experts BFP4\n",
+            f"Efficiencies: card {DEVICE['eff']:.0%} of 512 GB/s, DRAM {CPU_EFF:.0%} of peak, PCIe {PCIE_EFF:.0%}, "
+            f"{PCIE_RT_US:.0f} us round trip per layer. 'Card hit rate' = share of the 10 activated experts per layer found "
+            "on the card. Uniform routing gives the share of experts that fit; a measured popularity profile (Basalt ships "
+            "one) raises it. MTP speculative decoding is not included.\n",
+            "| Host | Dense format | uniform routing | 60% hits | 80% hits | time split at uniform: dense / hot / cold+PCIe (ms) |",
+            "|---|---|---:|---:|---:|---|"]
+    for hn, h in HOSTS.items():
+        for df in ["bfp8", "bfp4"]:
+            r0, t = decode(h, None, df)
+            r6, _ = decode(h, 0.6, df)
+            r8, _ = decode(h, 0.8, df)
+            out.append(f"| {hn} | {df} | {r0:.1f} t/s | {r6:.1f} | {r8:.1f} | "
+                       f"{1e3 * t['dense']:.1f} / {1e3 * t['hot']:.1f} / {1e3 * (t['cold'] + t['pcie']):.1f} |")
     return "\n".join(out)
 
 
 def _check():
-    m = MODELS["Qwen3-30B-A3B"]
-    p = parts(m)
-    total = p["attn"] + p["dense"] + p["lm_head"] + p["embed"] + p["n_experts"] * p["expert"]
-    assert abs(total / 1e9 - 30.5) < 0.2, total
-    active = p["attn"] + p["dense"] + p["lm_head"] + p["embed"] + p["moe_layers"] * m["k"] * p["expert"]
-    assert abs(active / 1e9 - 3.3) < 0.15, active
-    g = MODELS["gpt-oss-120b"]
-    pg = parts(g)
-    assert abs((pg["attn"] + pg["lm_head"] + pg["embed"] + pg["n_experts"] * pg["expert"]) / 1e9 - 116.8) < 1.0
-    assert plan(m, HOSTS["E5-2690v4 64GB"])["f"] == 1.0          # 30B-A3B experts fit on the card entirely
-    r = plan(g, HOSTS["E5-2690v4 64GB"])
-    assert r["fits"] and 0 < r["f"] < 1 and r["hybrid"] > r["stream"] > 0
+    p = params()
+    main = p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"] + p["embed"] + p["n_experts"] * p["expert"]
+    assert 123e9 < main < 128e9, main                       # published: ~125B main model
+    active = (p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"] + p["embed"]
+              + QFN["L"] * QFN["k"] * p["expert"])
+    assert 5.5e9 < active < 7.5e9, active   # published "~6B"; ours also counts embedding + LM head (1.3B)
+    assert abs(p["ngram"] / 1e9 - 51.2) < 0.1               # published: ~51B N-gram embeddings
+    mm = memory_map(host=HOSTS["E5-2690v4, 4x16GB"])
+    assert mm["fits"] and 0 < mm["f"] < 1
+    r_uni, _ = decode(HOSTS["E5-2690v4, 4x16GB"])
+    assert decode(HOSTS["E5-2690v4, 4x16GB"], 0.8)[0] > r_uni > 0
 
 
 if __name__ == "__main__":
     _check()
     root = Path(__file__).parent
     (root / "results").mkdir(exist_ok=True)
-    text = table()
+    text = report()
     (root / "results" / "plan.md").write_text(text + "\n", encoding="utf-8")
     print(text)

@@ -61,10 +61,9 @@ int main(void) {
         bfp_free(&m);
     }
     /* SQNR bounds match the Gaussian results in blackhole-llm (bfp8 ~43 dB, bfp4 ~19 dB) */
-    check(BFP8, 768, 2048, 40);
-    check(BFP4, 768, 2048, 17);
-    check(BFP4, 2048, 768, 17);
-    check(BFP8, 2880, 2880, 40);
+    check(BFP8, 640, 2560, 40);    /* QFN expert gate/up: 2560 -> 640 */
+    check(BFP4, 640, 2560, 17);
+    check(BFP4, 2560, 640, 17);    /* QFN expert down: 640 -> 2560 */
     /* moe_forward (one fused parallel region) == gate-weighted sum of expert_forward */
     {
         enum { K = 3, D = 256, I = 96 };
