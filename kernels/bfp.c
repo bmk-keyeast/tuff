@@ -145,6 +145,65 @@ static inline void panel(const bfp_mat *m, int p, const float *x, float *y16) {
     _mm256_storeu_ps(y16 + 8, _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(h0, h1), _mm256_add_ps(h2, h3)), corr));
 }
 
+/* n tokens (2..4) through one panel: y16[t] = W[16p:16p+16] x_t. Each column group is decoded once and used for every
+ * token, so a verification step (MTP) or a small batch streams the weights from DRAM once, not once per token.
+ * n is a compile-time constant at every call site (always_inline), so the accumulator arrays stay in registers. */
+#define STEPN(k, b) {                                                                       \
+    __m256 fl = _mm256_cvtepi32_ps(FIELD(lo, k, b, mask)), fh = _mm256_cvtepi32_ps(FIELD(hi, k, b, mask)); \
+    for (int t = 0; t < n; t++) {                                                           \
+        __m256 s = _mm256_broadcast_ss(a[t] + j + (k));                                     \
+        L[t] = _mm256_fmadd_ps(s, fl, L[t]);                                                \
+        H[t] = _mm256_fmadd_ps(s, fh, H[t]); } }
+
+static inline __attribute__((always_inline)) void panel_n(const bfp_mat *m, int p, const float *x, int ldx, int n,
+                                                          float *y, int ldy) {
+    const int in = m->in, mb = m->fmt;
+    float a[4][in];
+    const uint8_t *e = m->exp + (size_t)p * in;
+    const __m256i bias = _mm256_set1_epi32(mb - 1);
+    __m256 As[4], L[4], H[4];
+    for (int t = 0; t < n; t++) As[t] = L[t] = H[t] = _mm256_setzero_ps();
+    for (int j = 0; j < in; j += 8) {
+        __m256i ev = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(e + j)));
+        __m256 sc = _mm256_castsi256_ps(_mm256_and_si256(_mm256_cmpgt_epi32(ev, bias),
+                                                         _mm256_slli_epi32(_mm256_sub_epi32(ev, bias), 23)));
+        for (int t = 0; t < n; t++) {
+            __m256 v = _mm256_mul_ps(_mm256_loadu_ps(x + (size_t)t * ldx + j), sc);
+            _mm256_storeu_ps(a[t] + j, v);
+            As[t] = _mm256_add_ps(As[t], v);
+        }
+    }
+    const __m256i *mt = (const __m256i *)(m->mant + (size_t)p * in * 2 * bits(m->fmt));
+    if (m->fmt == BFP4) {
+        const __m256i mask = _mm256_set1_epi32(0xf);
+        for (int j = 0; j < in; j += 8, mt += 2) {
+            __m256i lo = _mm256_loadu_si256(mt), hi = _mm256_loadu_si256(mt + 1);
+            STEPN(0, 4) STEPN(1, 4) STEPN(2, 4) STEPN(3, 4) STEPN(4, 4) STEPN(5, 4) STEPN(6, 4) STEPN(7, 4)
+        }
+    } else {
+        const __m256i mask = _mm256_set1_epi32(0xff);
+        for (int j = 0; j < in; j += 4, mt += 2) {
+            __m256i lo = _mm256_loadu_si256(mt), hi = _mm256_loadu_si256(mt + 1);
+            STEPN(0, 8) STEPN(1, 8) STEPN(2, 8) STEPN(3, 8)
+        }
+    }
+    for (int t = 0; t < n; t++) {
+        __m256 corr = _mm256_set1_ps(-(float)(1 << mb) * hsum(As[t]));
+        _mm256_storeu_ps(y + (size_t)t * ldy, _mm256_add_ps(L[t], corr));
+        _mm256_storeu_ps(y + (size_t)t * ldy + 8, _mm256_add_ps(H[t], corr));
+    }
+}
+
+/* panel for n = 1..4 tokens: x[t] at x + t*ldx, y16[t] at y + t*ldy */
+static inline void panel_tokens(const bfp_mat *m, int p, const float *x, int ldx, int n, float *y, int ldy) {
+    switch (n) {
+    case 1: panel(m, p, x, y); break;
+    case 2: panel_n(m, p, x, ldx, 2, y, ldy); break;
+    case 3: panel_n(m, p, x, ldx, 3, y, ldy); break;
+    default: panel_n(m, p, x, ldx, 4, y, ldy); break;
+    }
+}
+
 void bfp_gemv(const bfp_mat *m, const float *x, float *y) {
 #pragma omp parallel for schedule(static)
     for (int p = 0; p < m->out / 16; p++) panel(m, p, x, y + 16 * p);
@@ -178,6 +237,43 @@ void moe_forward(const bfp_mat *const *w1, const bfp_mat *const *w3, const bfp_m
             float s = 0;
             for (int e = 0; e < k; e++) s += gate[e] * part[(size_t)e * d + o];
             y[o] = s;
+        }
+    }
+}
+
+/* Several tokens through k experts of one layer (MTP verification, small batches): every expert is read once per
+ * group of up to 4 tokens. gate: [k][n], 0 where token t is not routed to expert i.
+ * ponytail: an expert is computed for every token of the group, routed or not; the extra FMAs are free while the
+ * kernel waits on DRAM (n <= 4). Skip unrouted tokens if a profile ever shows compute-bound verification. */
+void moe_forward_n(const bfp_mat *const *w1, const bfp_mat *const *w3, const bfp_mat *const *w2,
+                   const float *gate, int k, int n, const float *x, float *y, float *tmp) {
+    const int I = w1[0]->out, d = w2[0]->out, PI = I / 16, PD = d / 16;
+    for (int t0 = 0; t0 < n; t0 += 4) {
+        const int g = n - t0 < 4 ? n - t0 : 4;
+        float *h = tmp, *part = tmp + (size_t)k * g * 2 * I;           /* h[e][t][2I], part[e][t][d] */
+#pragma omp parallel
+        {
+#pragma omp for collapse(2) schedule(static)
+            for (int e = 0; e < k; e++)
+                for (int p = 0; p < 2 * PI; p++)
+                    panel_tokens(p < PI ? w1[e] : w3[e], p % PI, x + (size_t)t0 * d, d, g,
+                                 h + (size_t)e * g * 2 * I + 16 * p, 2 * I);
+#pragma omp for schedule(static)
+            for (int i = 0; i < k * g * I; i++) {
+                float *q = h + (size_t)(i / I) * 2 * I + i % I, u = q[I];
+                *q = *q / (1.f + expf(-*q)) * u;
+            }
+#pragma omp for collapse(2) schedule(static)
+            for (int e = 0; e < k; e++)
+                for (int p = 0; p < PD; p++)
+                    panel_tokens(w2[e], p, h + (size_t)e * g * 2 * I, 2 * I, g, part + (size_t)e * g * d + 16 * p, d);
+#pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < g; t++)
+                for (int o = 0; o < d; o++) {
+                    float s = 0;
+                    for (int e = 0; e < k; e++) s += gate[(size_t)e * n + t0 + t] * part[((size_t)e * g + t) * d + o];
+                    y[(size_t)(t0 + t) * d + o] = s;
+                }
         }
     }
 }

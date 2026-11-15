@@ -45,4 +45,8 @@ void expert_forward(const bfp_mat *w1, const bfp_mat *w3, const bfp_mat *w2,
 /* One MoE layer, one token: y = sum_i gate[i] * expert_i(x). tmp: k*(2*I + d) floats */
 void moe_forward(const bfp_mat *const *w1, const bfp_mat *const *w3, const bfp_mat *const *w2,
                  const float *gate, int k, const float *x, float *y, float *tmp);
+/* n tokens (MTP verification): x, y: [n][d]; gate: [k][n], 0 = token not routed to that expert; each expert is read
+ * once per 4 tokens. tmp: k * min(n,4) * (2*I + d) floats */
+void moe_forward_n(const bfp_mat *const *w1, const bfp_mat *const *w3, const bfp_mat *const *w2,
+                   const float *gate, int k, int n, const float *x, float *y, float *tmp);
 #endif

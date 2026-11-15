@@ -17,7 +17,8 @@ jobs:
       - name: build phase-0 kernel (baseline)
         run: |
           mkdir /tmp/base && git show a5a7b99:kernels/bfp.c > /tmp/base/bfp.c && git show a5a7b99:kernels/bfp.h > /tmp/base/bfp.h
-          gcc -O3 -march=haswell -fopenmp -I/tmp/base kernels/bench_bfp.c /tmp/base/bfp.c -o /tmp/base/bench_bfp -lm
+          git show a5a7b99:kernels/bench_bfp.c > /tmp/base/bench_bfp.c
+          gcc -O3 -march=haswell -fopenmp /tmp/base/bench_bfp.c /tmp/base/bfp.c -o /tmp/base/bench_bfp -lm
       - name: bench
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)" > bench.txt
@@ -29,5 +30,8 @@ jobs:
                 echo "new  $(OMP_NUM_THREADS=$t ./kernels/bench_bfp $k $f 2048 400)" | tee -a bench.txt
               done
             done
+          done
+          for n in 1 2 3 4; do      # MTP verification: n tokens through the union of their cold experts (~12 for 3 tokens)
+            echo "mtp  $(OMP_NUM_THREADS=$(nproc) ./kernels/bench_bfp 12 bfp4 2048 200 $n)" | tee -a bench.txt
           done
           { echo '```'; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

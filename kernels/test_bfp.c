@@ -114,6 +114,21 @@ int main(int argc, char **argv) {
         moe_forward(pa, pc, pd, gate, K, x, y, tmp);
         for (int i = 0; i < D; i++) assert(fabsf(y[i] - ref[i]) <= 1e-5f * (fabsf(ref[i]) + 1e-2f));
         puts("moe_forward == sum of expert_forward");
+        /* moe_forward_n (n tokens, groups of 4) == moe_forward once per token with that token's gates */
+        enum { N = 7 };
+        float xs[N][D], ys[N][D], g[K][N], gt[K], tmpn[K * 4 * (2 * I + D)];
+        for (int t = 0; t < N; t++)
+            for (int i = 0; i < D; i++) xs[t][i] = randn();
+        for (int e = 0; e < K; e++)
+            for (int t = 0; t < N; t++) g[e][t] = (e + t) % 3 ? 0.f : 0.2f + 0.1f * e;   /* some tokens skip some experts */
+        moe_forward_n(pa, pc, pd, &g[0][0], K, N, &xs[0][0], &ys[0][0], tmpn);
+        for (int t = 0; t < N; t++) {
+            for (int e = 0; e < K; e++) gt[e] = g[e][t];
+            moe_forward(pa, pc, pd, gt, K, xs[t], ref, tmp);
+            /* different accumulation order than the 1-token kernel: float rounding ~1e-6; a wrong token or gate is ~1e-2 */
+            for (int i = 0; i < D; i++) assert(fabsf(ys[t][i] - ref[i]) <= 1e-4f * (fabsf(ref[i]) + 5e-2f));
+        }
+        puts("moe_forward_n == moe_forward per token");
         for (int e = 0; e < K; e++) { bfp_free(&a[e]); bfp_free(&c[e]); bfp_free(&dn[e]); }
         free(w1); free(w2);
     }
