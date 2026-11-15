@@ -22,8 +22,8 @@ this one model, and it is shaped by two facts about the hardware:
 Sibling project: [blackhole-llm](https://github.com/bmk-keyeast/blackhole-llm) (BFP accuracy study across 6 models).
 Part of the KEYEAST club's Tenstorrent work at Changwon Science High School.
 
-> **Status:** the QFN memory map, the decode-time model and the CPU expert kernels exist and are tested. The device path
-> (TT-NN), the `.gguf`/safetensors loader and the end-to-end engine do not exist yet. Every throughput number below is a
+> **Status:** the QFN memory map, the decode-time model, the CPU expert kernels and the routed-expert loader exist and are
+> tested. The device path (TT-NN), the loader for the dense weights and the end-to-end engine do not exist yet. Every throughput number below is a
 > **model prediction**, not a measurement on the target host.
 
 ## The model
@@ -88,6 +88,7 @@ What the model says to work on first:
 |---|---|
 | [`plan.py`](plan.py) | QFN parameter accounting (checked against the published 125B / ~6B / 51B), card/host/NVMe memory map, decode-time model |
 | [`kernels/bfp.c`](kernels/bfp.c) | BFP8/BFP4 pack/unpack, shuffle-free AVX2+FMA GEMV, SwiGLU expert, `moe_forward`: one OpenMP region over all (expert, 16-row panel) pairs of a layer |
+| [`loader.py`](loader.py) | Reads QFN's fused expert tensors from a local snapshot or over HTTP range requests, packs them bit-identically to the C packer, writes one memory-mappable file per layer (1.42 GB at BFP4, 68 GB for all 48), and measures real-weight accuracy |
 | [`kernels/test_bfp.c`](kernels/test_bfp.c) | Exact round-trip, SIMD = scalar = fp64 math, SQNR bounds at QFN expert shapes, fused layer = sum of experts (ASan/UBSan) |
 | [`kernels/bench_bfp.c`](kernels/bench_bfp.c) | Cold-expert throughput at QFN shapes from a DRAM pool larger than the caches |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Build, test and benchmark on every push (job summary) |
@@ -110,7 +111,27 @@ the exponent bits once per panel, and the offset is removed once per row. At 1 t
 Broadwell cores would be ~2–3× above the E5's ~48 GB/s of usable DRAM bandwidth, so cold experts should be memory-bound there.
 This has not been measured on the E5 yet. Next steps are AVX-512 VNNI for the 8259CL and a measurement on the real host.
 
+**Real QFN experts in TT block-float.** [`accuracy.yml`](.github/workflows/accuracy.yml) reads 48 random routed experts
+(8 from each of layers 0, 9, 19, 28, 38 and 47) straight from the 360 GB BF16 checkpoint, ~10 MB each, and compares them with
+their BFP versions. Full table: [`results/expert_accuracy.md`](results/expert_accuracy.md).
+
+| | BFP4 | BFP4 gate/up + BFP8 down | BFP8 |
+|---|---:|---:|---:|
+| Weight SQNR (Gaussian matrix: 19.0 / 43.1 dB) | 18.7 dB | – | 42.4 dB |
+| Expert output SQNR, mean (worst of 48) | 14.2 dB (13.1) | 16.1 dB (15.3) | 36.6 dB (35.8) |
+| Expert bytes | 2.76 MB | 3.58 MB (+30%) | 5.22 MB |
+
+- QFN's expert weights quantize like Gaussian noise. There are no outlier columns, and no layer stands out; the last layers
+  are only 0.2–0.4 dB worse.
+- Where the exponent is shared makes no difference: sharing it along the input dimension instead of TT's output dimension
+  gives the same 14.2 dB. TT's native layout costs nothing for these weights.
+- Keeping `down_proj` in BFP8 buys 1.9 dB of expert-output SQNR for 30% more bytes. Whether that is worth it depends on
+  model-level numbers (KLD, top-1 agreement), and those need the full forward pass. Expert inputs here are Gaussian, not
+  real hidden states.
+
 ```bash
+python loader.py accuracy                       # real-weight BFP accuracy -> results/expert_accuracy.md
+python loader.py convert /path/to/snapshot experts/ --fmt bfp4   # or SRC=hf to stream from Hugging Face
 python plan.py                                  # memory map + predicted t/s -> results/plan.md
 make -C kernels test                            # correctness
 make -C kernels bench_bfp
@@ -123,8 +144,10 @@ OMP_NUM_THREADS=14 ./kernels/bench_bfp 6 bfp4 8192   # 6 cold experts per layer,
 - [x] CPU kernels for TT block-float experts at QFN shapes, fused MoE layer, tests, CI benchmark
 - [x] Shuffle-free BFP decode: BFP4 2.1× faster per core (enough for the E5's DRAM bandwidth on paper)
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
-- [ ] Loader: QFN from `Qwen/Qwen3.8-Flash-Next` (BF16) to BFP panels; measure BFP4 expert accuracy (KLD, top-1 agreement) the
-      way Basalt reports its packs
+- [x] Loader: QFN routed experts from `Qwen/Qwen3.8-Flash-Next` (BF16) to BFP panels, bit-identical to the C packer;
+      real-weight SQNR of sampled experts
+- [ ] Model-level accuracy (KLD, top-1 agreement) the way Basalt reports its packs; needs the CPU reference forward below
+- [ ] Loader for the dense part (attention, shared expert, LM head) and the MTP layer's experts
 - [ ] CPU reference forward for one QFN layer (DeltaNet, full attention with indexer, hyper-connections, MoE) matching
       Hugging Face outputs
 - [ ] Device path on the p150a with TT-NN: attention, shared and hot experts, hidden-state exchange; measure the real round trip
@@ -149,6 +172,8 @@ PCIe 3.0이 호스트 메모리보다 훨씬 느리기 때문에 가중치는 �
 전문가 가중치는 Tenstorrent의 BFP4/BFP8 블록 포맷 그대로 저장해서, CPU와 카드가 재양자화 없이 같은 데이터를 씁니다.
 현재는 메모리 배치 계산, 속도 예측 모델, CPU 전문가 커널(테스트와 CI 벤치마크 포함)까지 구현했습니다.
 CPU 커널은 셔플 명령 없이 압축을 풀도록 다시 짜서, 같은 CI 머신에서 BFP4가 처음 버전보다 2.1배 빨라졌습니다.
+로더(`loader.py`)는 360GB 체크포인트 전체를 받지 않고 필요한 전문가만 HTTP 범위 요청으로 읽어 BFP로 변환하며, C 패커와 바이트 단위로 같은 결과를 냅니다.
+실제 QFN 전문가 48개를 측정한 결과, BFP4 가중치 SQNR은 18.7dB로 가우시안(19.0dB)과 거의 같았고, 지수 공유 방향(TT 방식)에 따른 손해도 없었습니다.
 
 ## License
 
