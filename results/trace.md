@@ -1,6 +1,6 @@
 ## Qwen3.8-Flash-Next forward pass, streamed from the checkpoint
 
-1024 tokens of each text (wikitext, code), 48 layers, batch = every (expert format, text) pair. Wall time 30 min on a GitHub runner.
+1024 tokens of each text (wikitext, code), 48 layers, batch = every (expert format, text) pair. Wall time 40 min on a GitHub runner.
 
 ### Accuracy of BFP experts (dense weights unquantized)
 
@@ -8,12 +8,14 @@ KLD and top-1 agreement are against the bf16 run on the same tokens.
 
 | Text | Experts | PPL | KLD mean | Same top-1 |
 |---|---|---:|---:|---:|
-| wikitext | bf16 | 1.614 | – | – |
-| wikitext | bfp4 | 1.656 | 0.0942 | 93.65% |
-| wikitext | bfp4+8 | 1.673 | 0.0732 | 94.72% |
+| wikitext | bf16 | 1.613 | – | – |
+| wikitext | bfp4 | 1.656 | 0.0944 | 93.74% |
+| wikitext | tuff | 1.675 | 0.0866 | 93.94% |
+| wikitext | tuff-fast | 2.158 | 0.4569 | 82.89% |
 | code | bf16 | 2.057 | – | – |
 | code | bfp4 | 2.078 | 0.0469 | 95.11% |
-| code | bfp4+8 | 2.076 | 0.0374 | 95.60% |
+| code | tuff | 2.086 | 0.0510 | 95.31% |
+| code | tuff-fast | 2.107 | 0.1876 | 91.59% |
 
 ### Routing
 
@@ -25,13 +27,14 @@ Hit rate = share of the 10 routed experts per token and layer that a placement k
 | in-sample (same text, upper bound) | wikitext | 97.0% | 97.8% |
 | in-sample (same text, upper bound) | code | 93.9% | 95.1% |
 | the other text's counts | wikitext | 35.7% | 40.0% |
-| the other text's counts | code | 27.6% | 30.8% |
+| the other text's counts | code | 27.6% | 30.7% |
 | Basalt's shipped profile | wikitext | 67.1% | 70.3% |
 | Basalt's shipped profile | code | 32.9% | 37.1% |
 
 Share of a token's experts that the previous token also used, same layer: wikitext 40.9%, code 36.8%.
 With bfp4 experts, 92.9% of the routed experts are the same as with bf16.
-With bfp4+8 experts, 94.0% of the routed experts are the same as with bf16.
+With tuff experts, 92.7% of the routed experts are the same as with bf16.
+With tuff-fast experts, 83.5% of the routed experts are the same as with bf16.
 
 ### Adaptive card cache (simulated on the trace)
 
@@ -41,7 +44,7 @@ With bfp4+8 experts, 94.0% of the routed experts are the same as with bf16.
 |---|---:|---:|---:|---:|---:|
 | wikitext | 67.1% (31.3 t/s) | 89.3% (37.4 t/s) | 93.8% (37.0 t/s) | 94.9% (36.9 t/s) | 95.1% (36.9 t/s) |
 | code | 32.9% (24.1 t/s) | 64.5% (30.1 t/s) | 86.3% (35.8 t/s) | 90.4% (36.5 t/s) | 91.3% (36.3 t/s) |
-| wikitext then code | 50.0% (27.2 t/s) | 75.9% (33.2 t/s) | 89.7% (37.3 t/s) | 92.4% (37.1 t/s) | 93.1% (37.1 t/s) |
+| wikitext then code | 50.0% (27.2 t/s) | 75.8% (33.2 t/s) | 89.7% (37.3 t/s) | 92.4% (37.1 t/s) | 93.1% (37.1 t/s) |
 
 ### Experts per layer when m consecutive tokens are verified together (MTP)
 
@@ -71,7 +74,7 @@ Adaptive cache with up to 25 copies per token, hit rate measured on 'wikitext th
 | Host | Dense on card | Hit rate | no MTP | prose | chat | structured |
 |---|---|---:|---:|---:|---:|---:|
 | E5-2690v4, 4x16GB | bfp8 | 89.7% | 37.3 | 59.6 | 68.1 | 126.1 |
-| E5-2690v4, 4x16GB | bfp4 | 91.1% | 58.3 | 84.7 | 95.4 | 166.3 |
+| E5-2690v4, 4x16GB | bfp4 | 91.1% | 58.3 | 84.7 | 95.3 | 166.3 |
 | 8259CL, 6x32GB | bfp8 | 89.7% | 37.4 | 60.4 | 69.3 | 130.5 |
 | 8259CL, 6x32GB | bfp4 | 91.1% | 58.3 | 86.5 | 97.8 | 173.9 |
 
