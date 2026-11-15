@@ -91,6 +91,20 @@ What the model says to work on first:
 | [`kernels/bench_bfp.c`](kernels/bench_bfp.c) | Cold-expert throughput at QFN shapes from a DRAM pool larger than the caches |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Build, test and benchmark on every push (job summary) |
 
+**First CI numbers** (GitHub runner, 4 vCPU, 2 GB expert pool; not the target host):
+
+| Format | Cold experts / layer | Layer time | Achieved | CPU expert time per token |
+|---|---:|---:|---:|---:|
+| BFP4 | 10 | 1562 µs | 17.7 GB/s | 75.0 ms |
+| BFP4 | 6 | 925 µs | 17.9 GB/s | 44.4 ms |
+| BFP8 | 10 | 1381 µs | 37.8 GB/s | 66.3 ms |
+| BFP8 | 6 | 811 µs | 38.6 GB/s | 38.9 ms |
+
+BFP8 moves twice the bytes and still finishes first, so **the BFP4 kernel is compute-bound** (nibble unpack + int→float per
+block), not memory-bound. Per vCPU it decodes ~4.4 GB/s, which on 14 Broadwell cores lands right at the ~48 GB/s DRAM
+limit, with no margin. Making BFP4 memory-bound on the E5 is the next kernel task (two blocks per 256-bit unpack, int8 activations
+with `vpmaddubsw`, and VNNI on the 8259CL).
+
 ```bash
 python plan.py                                  # memory map + predicted t/s -> results/plan.md
 make -C kernels test                            # correctness
@@ -102,6 +116,7 @@ OMP_NUM_THREADS=14 ./kernels/bench_bfp 6 bfp4 8192   # 6 cold experts per layer,
 
 - [x] QFN memory map and decode-time model for the E5-2690 v4 and 8259CL hosts
 - [x] CPU kernels for TT block-float experts at QFN shapes, fused MoE layer, tests, CI benchmark
+- [ ] Make the BFP4 kernel memory-bound (it is compute-bound on CI: 17.7 GB/s vs 37.8 GB/s for BFP8)
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
 - [ ] Loader: QFN from `Qwen/Qwen3.8-Flash-Next` (BF16) to BFP panels; measure BFP4 expert accuracy (KLD, top-1 agreement) the
       way Basalt reports its packs
