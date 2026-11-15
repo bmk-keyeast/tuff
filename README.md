@@ -16,7 +16,8 @@ this one model, and it is shaped by two facts about the hardware:
 - the host's PCIe 3.0 link is 4 to 9 times slower than its own DRAM, so **cold experts are computed on the CPU where they
   live**, and only hidden-state vectors cross the bus;
 - the card computes natively in block-float formats, so **experts are stored in Tenstorrent's `bfp4_b`/`bfp8_b` on both
-  sides**. Moving an expert between host RAM and the card is a block permutation, never a re-quantization.
+  sides**. Moving an expert between host RAM and the card is a byte permutation plus a table recode of each mantissa
+  (sign-magnitude on the card, offset binary on the host), never a re-quantization.
 
 Sibling project: [blackhole-llm](https://github.com/bmk-keyeast/blackhole-llm) (BFP accuracy study across 6 models).
 Part of the KEYEAST club's Tenstorrent work at Changwon Science High School.
@@ -86,24 +87,28 @@ What the model says to work on first:
 | Path | What |
 |---|---|
 | [`plan.py`](plan.py) | QFN parameter accounting (checked against the published 125B / ~6B / 51B), card/host/NVMe memory map, decode-time model |
-| [`kernels/bfp.c`](kernels/bfp.c) | BFP8/BFP4 pack/unpack, AVX2+FMA GEMV, SwiGLU expert, `moe_forward`: one OpenMP region over all (expert, 16-row panel) pairs of a layer |
+| [`kernels/bfp.c`](kernels/bfp.c) | BFP8/BFP4 pack/unpack, shuffle-free AVX2+FMA GEMV, SwiGLU expert, `moe_forward`: one OpenMP region over all (expert, 16-row panel) pairs of a layer |
 | [`kernels/test_bfp.c`](kernels/test_bfp.c) | Exact round-trip, SIMD = scalar = fp64 math, SQNR bounds at QFN expert shapes, fused layer = sum of experts (ASan/UBSan) |
 | [`kernels/bench_bfp.c`](kernels/bench_bfp.c) | Cold-expert throughput at QFN shapes from a DRAM pool larger than the caches |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Build, test and benchmark on every push (job summary) |
 
-**First CI numbers** (GitHub runner, 4 vCPU, 2 GB expert pool; not the target host):
+**CPU kernel benchmark.** CI builds the phase-0 kernel (`a5a7b99`) next to the current one and runs both on the same runner,
+because runner CPUs differ between runs. Numbers below: GitHub runner, 4 vCPU, 2 GB expert pool, 10 cold experts per layer; not the
+target host.
 
-| Format | Cold experts / layer | Layer time | Achieved | CPU expert time per token |
+| Format | Threads | Phase-0 kernel | Current kernel | Speed-up |
 |---|---:|---:|---:|---:|
-| BFP4 | 10 | 1562 µs | 17.7 GB/s | 75.0 ms |
-| BFP4 | 6 | 925 µs | 17.9 GB/s | 44.4 ms |
-| BFP8 | 10 | 1381 µs | 37.8 GB/s | 66.3 ms |
-| BFP8 | 6 | 811 µs | 38.6 GB/s | 38.9 ms |
+| BFP4 | 1 | 4.8 GB/s | 10.0 GB/s | 2.1× |
+| BFP4 | 4 | 9.6 GB/s | 20.6 GB/s | 2.1× |
+| BFP8 | 1 | 10.0 GB/s | 15.4 GB/s | 1.5× |
+| BFP8 | 4 | 20.2 GB/s | 35.2 GB/s | 1.7× |
 
-BFP8 moves twice the bytes and still finishes first, so **the BFP4 kernel is compute-bound** (nibble unpack + int→float per
-block), not memory-bound. Per vCPU it decodes ~4.4 GB/s, which on 14 Broadwell cores lands right at the ~48 GB/s DRAM
-limit, with no margin. Making BFP4 memory-bound on the E5 is the next kernel task (two blocks per 256-bit unpack, int8 activations
-with `vpmaddubsw`, and VNNI on the 8259CL).
+The phase-0 kernel decoded each block with `pshufb` and `pmovsxbd`, and both use only port 5 on Broadwell/Haswell. Now the
+host keeps the same blocks in a different byte order, as offset-binary fields in row-major dwords. One 256-bit load then covers
+8 rows × 8 columns (BFP4), and each column decodes with shift + and + int→float, with no shuffles. Block scales are built from
+the exponent bits once per panel, and the offset is removed once per row. At 1 thread, BFP4 now does ~10 GB/s per core. 14
+Broadwell cores would be ~2–3× above the E5's ~48 GB/s of usable DRAM bandwidth, so cold experts should be memory-bound there.
+This has not been measured on the E5 yet. Next steps are AVX-512 VNNI for the 8259CL and a measurement on the real host.
 
 ```bash
 python plan.py                                  # memory map + predicted t/s -> results/plan.md
@@ -116,7 +121,7 @@ OMP_NUM_THREADS=14 ./kernels/bench_bfp 6 bfp4 8192   # 6 cold experts per layer,
 
 - [x] QFN memory map and decode-time model for the E5-2690 v4 and 8259CL hosts
 - [x] CPU kernels for TT block-float experts at QFN shapes, fused MoE layer, tests, CI benchmark
-- [ ] Make the BFP4 kernel memory-bound (it is compute-bound on CI: 17.7 GB/s vs 37.8 GB/s for BFP8)
+- [x] Shuffle-free BFP decode: BFP4 2.1× faster per core (enough for the E5's DRAM bandwidth on paper)
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
 - [ ] Loader: QFN from `Qwen/Qwen3.8-Flash-Next` (BF16) to BFP panels; measure BFP4 expert accuracy (KLD, top-1 agreement) the
       way Basalt reports its packs
@@ -143,6 +148,7 @@ connector (≥ 800 W suggested), a free slot next to the dual-slot card, and PCI
 PCIe 3.0이 호스트 메모리보다 훨씬 느리기 때문에 가중치는 버스로 옮기지 않고 은닉 상태 벡터만 주고받습니다.
 전문가 가중치는 Tenstorrent의 BFP4/BFP8 블록 포맷 그대로 저장해서, CPU와 카드가 재양자화 없이 같은 데이터를 씁니다.
 현재는 메모리 배치 계산, 속도 예측 모델, CPU 전문가 커널(테스트와 CI 벤치마크 포함)까지 구현했습니다.
+CPU 커널은 셔플 명령 없이 압축을 풀도록 다시 짜서, 같은 CI 머신에서 BFP4가 처음 버전보다 2.1배 빨라졌습니다.
 
 ## License
 
