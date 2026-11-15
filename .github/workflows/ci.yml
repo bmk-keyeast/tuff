@@ -11,6 +11,8 @@ jobs:
         with: { fetch-depth: 0 }   # the phase-0 kernel is benchmarked as a fixed baseline
       - run: python plan.py > /dev/null
       - run: make -C kernels test
+      - name: loader.py packs exactly like bfp_pack
+        run: pip install -q numpy && python loader.py selftest kernels/selftest.bin && ./kernels/test_bfp kernels/selftest.bin
       - run: make -C kernels bench_bfp
       - name: build phase-0 kernel (baseline)
         run: |

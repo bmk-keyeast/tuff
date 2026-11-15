@@ -1,3 +1,4 @@
 kernels/test_bfp
 kernels/bench_bfp
 __pycache__/
+kernels/selftest.bin

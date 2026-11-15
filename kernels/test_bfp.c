@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static float randn(void) {   /* Box-Muller */
     float u = (rand() + 1.f) / (RAND_MAX + 2.f), v = (rand() + 1.f) / (RAND_MAX + 2.f);
@@ -47,7 +48,33 @@ static void check(enum bfp_fmt fmt, int out, int in, double min_sqnr) {
     bfp_free(&m); free(w); free(wq); free(x); free(y); free(yr);
 }
 
-int main(void) {
+/* `test_bfp FILE`: FILE from `python loader.py selftest`, records of {int32 mbits, out, in; float w[out][in];
+ * exp; mant} packed by the Python loader. The C packer must produce the same bytes. */
+static int check_loader(const char *path) {
+    FILE *f = fopen(path, "rb");
+    int hdr[3], n = 0;
+    assert(f);
+    while (fread(hdr, sizeof hdr, 1, f) == 1) {
+        bfp_mat m;
+        assert(bfp_alloc(&m, (enum bfp_fmt)hdr[0], hdr[1], hdr[2]) == 0);
+        size_t ne = (size_t)(hdr[1] / 16) * hdr[2], nm = bfp_mant_bytes(m.fmt, hdr[1], hdr[2]);
+        float *w = malloc(sizeof(float) * hdr[1] * hdr[2]);
+        uint8_t *ex = malloc(ne), *mt = malloc(nm);
+        assert(fread(w, sizeof(float), (size_t)hdr[1] * hdr[2], f) == (size_t)hdr[1] * hdr[2]);
+        assert(fread(ex, 1, ne, f) == ne && fread(mt, 1, nm, f) == nm);
+        bfp_pack(&m, w);
+        assert(!memcmp(ex, m.exp, ne) && !memcmp(mt, m.mant, nm));
+        bfp_free(&m); free(w); free(ex); free(mt);
+        n++;
+    }
+    fclose(f);
+    assert(n > 0);
+    printf("loader.py packing == bfp_pack, byte for byte (%d matrices)\n", n);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) return check_loader(argv[1]);
     /* exactly representable block: must round-trip bit-exactly (incl. negative and zero) */
     float w[16] = {1, -0.5f, 0.25f, 0.75f, 0, -1, 0.5f, -0.25f};   /* multiples of 1/4: exact in bfp4 too */
     for (int fmt = 0; fmt < 2; fmt++) {
