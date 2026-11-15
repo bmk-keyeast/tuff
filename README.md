@@ -22,9 +22,32 @@ this one model, and it is shaped by two facts about the hardware:
 Sibling project: [blackhole-llm](https://github.com/bmk-keyeast/blackhole-llm) (BFP accuracy study across 6 models).
 Part of the KEYEAST club's Tenstorrent work at Changwon Science High School.
 
-> **Status:** the QFN memory map, the decode-time model, the CPU expert kernels and the routed-expert loader exist and are
-> tested. The device path (TT-NN), the loader for the dense weights and the end-to-end engine do not exist yet. Every throughput number below is a
-> **model prediction**, not a measurement on the target host.
+> **Status (before the card arrives):** done and tested: the memory map, the decode-time model, the CPU expert kernels
+> (1-token and multi-token for MTP), the routed-expert loader, and a **real 48-layer QFN forward pass** that measures
+> model-level accuracy and records expert routing. Not done: the device path (TT-NN), the adaptive cache in engine code,
+> and the end-to-end engine. Every throughput number below is a **model prediction** fed by measured routing, not a
+> measurement on the target host.
+
+## Headline
+
+Predicted decode, batch 1, 4k context, E5-2690 v4 with 64 GB, routed experts BFP4, dense weights on the card BFP8
+(the format whose accuracy cost is measured below as negligible). Hit rate measured on a real routing trace that switches
+from prose to code; MTP acceptance taken from Basalt's community benchmarks.
+
+| | no MTP | MTP, prose | MTP, chat | MTP, structured output |
+|---|---:|---:|---:|---:|
+| **tuff (adaptive cache + MTP)** | **37 t/s** | **60 t/s** | **68 t/s** | **126 t/s** |
+| static placement, Basalt's profile, no MTP | 27 t/s | | | |
+
+How it gets there, each step measured on the real model on CI:
+
+1. **BFP4 experts + BFP8 dense cost about as much as Basalt's 4-bit packs**: KLD 0.05–0.09, 94–95% same top-1 token.
+2. **A static hot-expert placement breaks when the topic changes**: Basalt's profile keeps 67% of routed experts on the
+   card for prose but only 33% for code, worse than a uniform pick (40%).
+3. **An adaptive card cache fixes it**: copying up to 25 missed experts per token to the card (LRU eviction) holds ~90%
+   hits across the prose→code switch, and plan.py charges those copies to DRAM and PCIe bandwidth.
+4. **MTP verification amortizes the dense part**: 4 tokens touch 26 experts per layer, not 40, and the multi-token CPU kernel
+   runs 4 tokens in 1.94× the time of one.
 
 ## The model
 
@@ -52,46 +75,64 @@ From `Qwen/Qwen3.8-Flash-Next` `config.json` (`qwen4_exp_text`):
 
 | Where | What |
 |---|---|
-| p150a (32 GB) | attention (all 48 layers), router, shared expert, hyper-connection mixers, LM head, KV cache and DeltaNet state, and the hot routed experts: **~9,800 of 24,576 (40%)** at BFP4 with dense weights in BFP8 |
-| host DRAM | the other ~14,800 routed experts (~41 GB in BFP4), computed in place by the CPU; token embeddings; the MTP layer's experts |
+| p150a (32 GB) | attention (all 48 layers), router, shared expert, hyper-connection mixers, LM head, KV cache and DeltaNet state, and a cache of routed experts: **~9,800 of 24,576 (40%)** at BFP4 with dense weights in BFP8 |
+| host DRAM | all routed experts (~68 GB in BFP4 with 128 GB of RAM, or the ~41 GB not on the card with 64 GB), computed in place by the CPU on a card miss; token embeddings; the MTP layer's experts |
 | NVMe or DRAM | the N-gram table (~28.8 GB quantized, as in Strata): memory-mapped from NVMe with 64 GB of RAM, resident in RAM with 128 GB. Each token reads only a few rows, and the row indices are known as soon as the previous token is sampled, so they can be prefetched |
 
 Per layer, the card runs attention, sends the hidden state to the host, both sides run their experts in parallel, and the
-host sends its partial sum back: `t_token = t_dense + max(t_hot, t_cold + t_pcie)`.
+host sends its partial sum back: `t_token = t_dense + max(t_hot, t_cold + t_pcie)`. Experts that missed are copied to the
+card in the background for the next token.
 
-## Predicted decode speed (batch 1, 4k context, experts BFP4)
+## Real forward pass: accuracy and routing
 
-From [`plan.py`](plan.py). Efficiency knobs: card 43% of peak (calibrated in blackhole-llm), DRAM 70%, PCIe 80%, a guessed
-30 µs host↔card round trip per layer. "Hit rate" is the share of the 10 activated experts found on the card: uniform routing
-gives the 40% that fit, and a measured popularity profile (Basalt ships one) raises it. MTP drafting is not included.
-Full output: [`results/plan.md`](results/plan.md).
+[`trace.py`](trace.py) runs the real model on a 16 GB GitHub runner without downloading the 360 GB checkpoint: it builds
+QFN from the `transformers` source on the meta device, then streams one layer at a time from Hugging Face with HTTP range
+requests, fetching only the experts that the tokens actually route to (~470 of 512 per layer, at ~560 MB/s). 1024 tokens of
+wikitext and 1024 tokens of Python run through all 48 layers in ~30 min, once per weight format in the same batch.
+The bf16 perplexity (wikitext 1.61, code 2.06) shows the streamed forward pass is correct. Full report:
+[`results/trace.md`](results/trace.md); the routing trace is in [`results/routes.npz`](results/routes.npz).
 
-| Host | Dense on card | Uniform routing | 60% hits | 80% hits |
-|---|---|---:|---:|---:|
-| E5-2690 v4, 64 GB | BFP8 | 25.4 t/s | 29.5 | 35.2 |
-| E5-2690 v4, 64 GB | BFP4 | 34.7 t/s | 41.2 | 53.5 |
-| 8259CL, 6 × 32 GB | BFP8 | 32.4 t/s | 35.4 | 38.2 |
-| 8259CL, 6 × 32 GB | BFP4 | 48.2 t/s | 54.0 | 60.7 |
+**Accuracy** (KLD and top-1 agreement against bf16 on the same tokens):
 
-What the model says to work on first:
-1. **The card's dense part dominates.** At BFP8, attention, the shared expert and the LM head take 21 ms of a 39 ms token on
-   the E5, more than the CPU's cold experts (18 ms). BFP4 attention halves it, and blackhole-llm measured which projections
-   tolerate BFP4 (WO almost free, LM head the most sensitive). The card's real efficiency on these shapes is the biggest
-   unknown.
-2. **Expert popularity matters more than CPU speed.** Going from a uniform 40% to 80% card hits is worth more than the
-   8259CL upgrade.
-3. **64 GB of RAM is enough** (cold experts ~43 GB). 128 GB moves the N-gram table off NVMe.
+| Format | Dense on card | Routed experts | KLD wikitext / code | Same top-1 wikitext / code |
+|---|---|---|---:|---:|
+| bfp4 | bf16 | BFP4 | 0.094 / 0.047 | 93.7% / 95.1% |
+| **tuff** | **BFP8** (LM head BFP8) | **BFP4** | **0.087 / 0.051** | **93.9% / 95.3%** |
+| tuff-fast | BFP4 (LM head BFP8) | BFP4 | 0.457 / 0.188 | 82.9% / 91.6% |
+
+- BFP8 for the dense part is free: the error is the experts' alone.
+- BFP4 for *every* dense projection is not: it would make decode ~55% faster on paper (58 → 166 t/s in the headline table)
+  but costs 11 points of top-1 on prose. The next step is per-projection precision, as blackhole-llm found for other models
+  (some projections are nearly free in BFP4, others are not).
+
+**Routing** (share of the 10 routed experts per token and layer that a placement keeps on the card, 9,815 experts on card):
+
+| Placement | wikitext | code |
+|---|---:|---:|
+| uniform | 39.9% | 39.9% |
+| Basalt's shipped popularity profile | 67.1% | 32.9% |
+| profile from the *other* text | 35.7% | 27.6% |
+| profile from the same text (upper bound) | 97.0% | 93.9% |
+| **adaptive LRU cache, ≤ 25 copies per token** | **93.8%** | **86.3%** |
+
+41% of a token's experts were also used by the previous token in the same layer, which is why a small LRU cache recovers
+almost all of the in-sample upper bound. On the prose→code sequence, the cache holds 89.7% hits (static profile: 50.0%).
+
+**MTP.** For m tokens verified together, a layer reads the union of their experts once: 10.0, 16.1, 21.4, 26.1 unique
+experts for m = 1, 2, 3, 4 (measured on the trace). [`moe_forward_n`](kernels/bfp.c) streams each cold expert once per
+group of 4 tokens; on CI, 4 tokens take 1.94× the time of 1.
 
 ## What exists
 
 | Path | What |
 |---|---|
-| [`plan.py`](plan.py) | QFN parameter accounting (checked against the published 125B / ~6B / 51B), card/host/NVMe memory map, decode-time model |
-| [`kernels/bfp.c`](kernels/bfp.c) | BFP8/BFP4 pack/unpack, shuffle-free AVX2+FMA GEMV, SwiGLU expert, `moe_forward`: one OpenMP region over all (expert, 16-row panel) pairs of a layer |
+| [`plan.py`](plan.py) | QFN parameter accounting (checked against the published 125B / ~6B / 51B), card/host/NVMe memory map, decode-time model with cache promotions and MTP |
+| [`kernels/bfp.c`](kernels/bfp.c) | BFP8/BFP4 pack/unpack, shuffle-free AVX2+FMA GEMV, SwiGLU expert, `moe_forward` (one OpenMP region over all expert panels of a layer), `moe_forward_n` (n tokens per weight read, for MTP) |
 | [`loader.py`](loader.py) | Reads QFN's fused expert tensors from a local snapshot or over HTTP range requests, packs them bit-identically to the C packer, writes one memory-mappable file per layer (1.42 GB at BFP4, 68 GB for all 48), and measures real-weight accuracy |
-| [`kernels/test_bfp.c`](kernels/test_bfp.c) | Exact round-trip, SIMD = scalar = fp64 math, SQNR bounds at QFN expert shapes, fused layer = sum of experts (ASan/UBSan) |
-| [`kernels/bench_bfp.c`](kernels/bench_bfp.c) | Cold-expert throughput at QFN shapes from a DRAM pool larger than the caches |
-| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Build, test and benchmark on every push (job summary) |
+| [`trace.py`](trace.py) | Streamed real forward pass: model-level accuracy per format, routing trace, cache and MTP simulation → [`results/trace.md`](results/trace.md) |
+| [`kernels/test_bfp.c`](kernels/test_bfp.c) | Exact round-trip, SIMD = scalar = fp64 math, SQNR bounds at QFN expert shapes, fused layer = sum of experts, multi-token = per-token, Python packer = C packer (ASan/UBSan) |
+| [`kernels/bench_bfp.c`](kernels/bench_bfp.c) | Cold-expert throughput at QFN shapes from a DRAM pool larger than the caches, 1–8 tokens |
+| [`.github/workflows/`](.github/workflows) | `ci` (build, test, benchmark every push), `accuracy` (sampled experts), `trace` (full forward pass) |
 
 **CPU kernel benchmark.** CI builds the phase-0 kernel (`a5a7b99`) next to the current one and runs both on the same runner,
 because runner CPUs differ between runs. Numbers below: GitHub runner, 4 vCPU, 2 GB expert pool, 10 cold experts per layer; not the
@@ -109,33 +150,19 @@ host keeps the same blocks in a different byte order, as offset-binary fields in
 8 rows × 8 columns (BFP4), and each column decodes with shift + and + int→float, with no shuffles. Block scales are built from
 the exponent bits once per panel, and the offset is removed once per row. At 1 thread, BFP4 now does ~10 GB/s per core. 14
 Broadwell cores would be ~2–3× above the E5's ~48 GB/s of usable DRAM bandwidth, so cold experts should be memory-bound there.
-This has not been measured on the E5 yet. Next steps are AVX-512 VNNI for the 8259CL and a measurement on the real host.
+This has not been measured on the E5 yet.
 
-**Real QFN experts in TT block-float.** [`accuracy.yml`](.github/workflows/accuracy.yml) reads 48 random routed experts
-(8 from each of layers 0, 9, 19, 28, 38 and 47) straight from the 360 GB BF16 checkpoint, ~10 MB each, and compares them with
-their BFP versions. Full table: [`results/expert_accuracy.md`](results/expert_accuracy.md).
-
-| | BFP4 | BFP4 gate/up + BFP8 down | BFP8 |
-|---|---:|---:|---:|
-| Weight SQNR (Gaussian matrix: 19.0 / 43.1 dB) | 18.7 dB | – | 42.4 dB |
-| Expert output SQNR, mean (worst of 48) | 14.2 dB (13.1) | 16.1 dB (15.3) | 36.6 dB (35.8) |
-| Expert bytes | 2.76 MB | 3.58 MB (+30%) | 5.22 MB |
-
-- QFN's expert weights quantize like Gaussian noise. There are no outlier columns, and no layer stands out; the last layers
-  are only 0.2–0.4 dB worse.
-- Where the exponent is shared makes no difference: sharing it along the input dimension instead of TT's output dimension
-  gives the same 14.2 dB. TT's native layout costs nothing for these weights.
-- Keeping `down_proj` in BFP8 buys 1.9 dB of expert-output SQNR for 30% more bytes. Whether that is worth it depends on
-  model-level numbers (KLD, top-1 agreement), and those need the full forward pass. Expert inputs here are Gaussian, not
-  real hidden states.
+**Real QFN experts in TT block-float** ([`results/expert_accuracy.md`](results/expert_accuracy.md), 48 sampled experts):
+BFP4 weight SQNR 18.7 dB, the same as a Gaussian matrix (19.0 dB), with no outlier columns and no layer standing out.
+Sharing the exponent along TT's output dimension costs nothing against the input dimension.
 
 ```bash
-python loader.py accuracy                       # real-weight BFP accuracy -> results/expert_accuracy.md
-python loader.py convert /path/to/snapshot experts/ --fmt bfp4   # or SRC=hf to stream from Hugging Face
 python plan.py                                  # memory map + predicted t/s -> results/plan.md
 make -C kernels test                            # correctness
 make -C kernels bench_bfp
-OMP_NUM_THREADS=14 ./kernels/bench_bfp 6 bfp4 8192   # 6 cold experts per layer, 8 GB pool
+OMP_NUM_THREADS=14 ./kernels/bench_bfp 6 bfp4 8192 400 4   # 6 cold experts, 8 GB pool, 4 tokens per read
+python loader.py convert /path/to/snapshot experts/ --fmt bfp4   # or SRC=hf to stream from Hugging Face
+python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof   # ~16 GB RAM; CI: trace workflow
 ```
 
 ## Roadmap
@@ -143,16 +170,16 @@ OMP_NUM_THREADS=14 ./kernels/bench_bfp 6 bfp4 8192   # 6 cold experts per layer,
 - [x] QFN memory map and decode-time model for the E5-2690 v4 and 8259CL hosts
 - [x] CPU kernels for TT block-float experts at QFN shapes, fused MoE layer, tests, CI benchmark
 - [x] Shuffle-free BFP decode: BFP4 2.1× faster per core (enough for the E5's DRAM bandwidth on paper)
+- [x] Loader: QFN routed experts to BFP panels, bit-identical to the C packer; real-weight SQNR
+- [x] Real 48-layer forward pass on CI: model-level KLD / top-1 per format, routing trace
+- [x] Expert placement from routing traces: static profiles measured, adaptive LRU cache simulated
+- [x] Multi-token expert kernel for MTP verification
+- [ ] Per-projection precision for the dense part (which projections tolerate BFP4)
+- [ ] Adaptive cache in engine code: miss queue, background PCIe copies, LRU on the card
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
-- [x] Loader: QFN routed experts from `Qwen/Qwen3.8-Flash-Next` (BF16) to BFP panels, bit-identical to the C packer;
-      real-weight SQNR of sampled experts
-- [ ] Model-level accuracy (KLD, top-1 agreement) the way Basalt reports its packs; needs the CPU reference forward below
-- [ ] Loader for the dense part (attention, shared expert, LM head) and the MTP layer's experts
-- [ ] CPU reference forward for one QFN layer (DeltaNet, full attention with indexer, hyper-connections, MoE) matching
-      Hugging Face outputs
-- [ ] Device path on the p150a with TT-NN: attention, shared and hot experts, hidden-state exchange; measure the real round trip
-- [ ] Expert popularity profile from routing traces → card placement
-- [ ] MTP speculative decoding
+- [ ] Device path on the p150a with TT-NN: attention, shared and cached experts, hidden-state exchange; measure the real round trip
+- [ ] MTP speculative decoding end to end; measure QFN's own acceptance rate
+- [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
 - [ ] N-gram table on NVMe with prefetch
 - [ ] AVX-512 VNNI kernels for the 8259CL
 - [ ] OpenAI- and Anthropic-compatible server
@@ -160,20 +187,29 @@ OMP_NUM_THREADS=14 ./kernels/bench_bfp 6 bfp4 8192   # 6 cold experts per layer,
 ## Host notes for the p150a
 
 The card wants PCIe 5.0 x16; both host platforms are PCIe 3.0. The card still works, and this design keeps bus traffic to
-activations, so the slower link costs latency rather than bandwidth. Also required: an ATX 3.1 PSU with a 12V-2x6
-connector (≥ 800 W suggested), a free slot next to the dual-slot card, and PCIe AER reporting set to "OS First" in the BIOS.
+activations and a capped number of expert copies, so the slower link costs latency rather than bandwidth. Also required:
+an ATX 3.1 PSU with a 12V-2x6 connector (≥ 800 W suggested), a free slot next to the dual-slot card, and PCIe AER
+reporting set to "OS First" in the BIOS.
 
 ## 한국어 요약
 
-**Qwen3.8-Flash-Next 전용** 추론 엔진입니다. NVIDIA GPU용인 Strata와 Basalt처럼 이 모델 하나만을 위해 만들지만,
+**Qwen3.8-Flash-Next 전용** 추론 엔진입니다. NVIDIA GPU용인 Strata·Basalt처럼 이 모델 하나만을 위해 만들지만,
 대상 하드웨어는 Tenstorrent Blackhole p150a 한 장과 DDR4 제온 서버(E5-2690 v4, 이후 8259CL)입니다.
-카드에는 어텐션, 공유 전문가, LM head와 들어가는 만큼의 전문가(약 40%)를 두고, 나머지 전문가는 호스트 CPU가 DRAM에서 직접 계산합니다.
-PCIe 3.0이 호스트 메모리보다 훨씬 느리기 때문에 가중치는 버스로 옮기지 않고 은닉 상태 벡터만 주고받습니다.
-전문가 가중치는 Tenstorrent의 BFP4/BFP8 블록 포맷 그대로 저장해서, CPU와 카드가 재양자화 없이 같은 데이터를 씁니다.
-현재는 메모리 배치 계산, 속도 예측 모델, CPU 전문가 커널(테스트와 CI 벤치마크 포함)까지 구현했습니다.
-CPU 커널은 셔플 명령 없이 압축을 풀도록 다시 짜서, 같은 CI 머신에서 BFP4가 처음 버전보다 2.1배 빨라졌습니다.
-로더(`loader.py`)는 360GB 체크포인트 전체를 받지 않고 필요한 전문가만 HTTP 범위 요청으로 읽어 BFP로 변환하며, C 패커와 바이트 단위로 같은 결과를 냅니다.
-실제 QFN 전문가 48개를 측정한 결과, BFP4 가중치 SQNR은 18.7dB로 가우시안(19.0dB)과 거의 같았고, 지수 공유 방향(TT 방식)에 따른 손해도 없었습니다.
+카드에는 어텐션, 공유 전문가, LM head와 전문가 캐시(약 40%)를 두고, 카드에 없는 전문가는 호스트 CPU가 DRAM에서 직접 계산합니다.
+전문가는 Tenstorrent의 BFP4/BFP8 블록 포맷 그대로 저장해서 CPU와 카드가 재양자화 없이 같은 데이터를 씁니다.
+
+**지금까지 한 것 (카드 도착 전 단계):**
+- CPU 전문가 커널: 셔플 없는 BFP 디코딩으로 처음보다 2.1배 빠름, MTP용 다중 토큰 커널(4토큰을 1토큰의 1.94배 시간에)
+- 로더: 360GB 체크포인트에서 필요한 전문가만 받아 BFP로 변환, C 패커와 바이트 단위로 동일
+- **실제 QFN 48층 전체 forward를 GitHub Actions에서 실행** (레이어 단위 스트리밍, 30분). BF16 퍼플렉서티가 정상이라 실행이 맞음을 확인
+  - 전문가 BFP4 + 카드 쪽 가중치 BFP8: KLD 0.05~0.09, top-1 일치 94~95% (Basalt 4비트 팩 수준). BFP8 dense는 손해가 거의 없음
+  - dense까지 전부 BFP4로 하면 top-1이 83%로 떨어져서 그대로는 못 씀 → 프로젝션별로 정밀도를 다르게 줄 예정
+- 실제 라우팅 기록 분석: Basalt의 고정 배치는 글에서 67%, 코드에서 33%만 카드에 적중. 적응형 캐시(놓친 전문가를 토큰당 25개까지 카드로 복사)는 주제가 바뀌어도 약 90% 적중
+
+**예측 속도 (E5-2690 v4, 64GB):** MTP 없이 37 t/s, MTP 사용 시 일반 글 60, 대화 68, 구조화 출력 126 t/s.
+실제 하드웨어 측정이 아니라 측정한 라우팅으로 계산한 예측입니다.
+
+**다음 할 일:** dense 프로젝션별 정밀도 결정, 적응형 캐시를 엔진 코드로 구현, 카드가 오면 TT-NN 카드 경로와 실측.
 
 ## License
 
