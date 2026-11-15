@@ -41,7 +41,7 @@ def params(m=QFN):
     lin = d * (2 * kd + 2 * vd) + d * 2 * m["lin_v_heads"] + vd * d + (2 * kd + vd) * m["conv"]
     hc = 2 * 2 * (m["hc"] * d * m["hc_rank"])
     expert = 3 * d * m["I"]
-    return dict(attn=n_full * full + n_lin * lin, shared=L * 3 * d * m["S"], router=L * d * m["E"], hc=L * hc,
+    return dict(attn=n_full * full + n_lin * lin, attn_full=full, shared=L * 3 * d * m["S"], router=L * d * m["E"], hc=L * hc,
                 lm_head=m["V"] * d, embed=m["V"] * d, ngram=m["ngram_rows"] * d,
                 expert=expert, n_experts=L * m["E"], mtp_experts=m["E"] * expert,
                 n_full=n_full, n_lin=n_lin)
@@ -94,6 +94,30 @@ def decode(host, hit=None, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096):
     return 1 / (t_dense + max(t_hot, t_cold + t_pcie)), dict(dense=t_dense, hot=t_hot, cold=t_cold, pcie=t_pcie)
 
 
+DRAFT_VOCAB = 106_299   # ponytail: Basalt's convert/draft_vocab.bin read as int32 ids; replace with the real count
+
+
+def decode_mtp(host, hot, cold, m, accepted, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096):
+    """Tokens/s with MTP speculative decoding. Each step drafts m-1 tokens with the MTP layer, then verifies m tokens
+    in one pass, so the card reads its dense weights once per step instead of once per token.
+    hot, cold: routed experts per layer that the m tokens need together, on the card and on the CPU (measured by
+    trace.py). accepted: tokens emitted per step (1 + accepted drafts)."""
+    p, q = params(), QFN
+    mm = memory_map(dense_fmt, expert_fmt, ctx, host)
+    dev_bw, cpu_bw, b = DEVICE["bw"] * DEVICE["eff"], host["bw"] * CPU_EFF, B[dense_fmt]
+    # ponytail: card compute ignored; m <= 8 tokens stays bandwidth-bound on 120 Tensix cores
+    t_dense = (mm["dense"] + mm["kv"] * m + mm["state"]) / dev_bw
+    t_hot = q["L"] * hot * mm["eb"] / dev_bw
+    t_cold = q["L"] * cold * mm["eb"] / cpu_bw
+    t_pcie = q["L"] * (PCIE_RT_US * 1e-6 + 2 * m * q["d"] * 2 / (PCIE * PCIE_EFF))
+    # one draft token: the MTP layer (full attention, shared expert, router, hyper-connections, two d x d input
+    # projections, draft head over the reduced vocabulary) on the card, its 10 routed experts on the CPU
+    mtp_dense = (p["attn_full"] + 3 * q["d"] * q["S"] + q["d"] * q["E"] + p["hc"] / q["L"] + 2 * q["d"] ** 2
+                 + DRAFT_VOCAB * q["d"]) * b
+    t_draft = mtp_dense / dev_bw + q["k"] * mm["eb"] / cpu_bw + PCIE_RT_US * 1e-6
+    return accepted / (t_dense + max(t_hot, t_cold + t_pcie) + (m - 1) * t_draft)
+
+
 def report():
     p = params()
     main = p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"] + p["embed"] + p["n_experts"] * p["expert"]
@@ -141,6 +165,9 @@ def _check():
     assert mm["fits"] and 0 < mm["f"] < 1
     r_uni, _ = decode(HOSTS["E5-2690v4, 4x16GB"])
     assert decode(HOSTS["E5-2690v4, 4x16GB"], 0.8)[0] > r_uni > 0
+    # MTP with m = 1 and nothing accepted beyond the token itself is plain decode (no draft cost)
+    h = memory_map(ctx=4096, host=HOSTS["E5-2690v4, 4x16GB"])["f"]    # decode()'s context
+    assert abs(decode_mtp(HOSTS["E5-2690v4, 4x16GB"], 10 * h, 10 * (1 - h), 1, 1) - r_uni) < 1e-6 * r_uni
 
 
 if __name__ == "__main__":

@@ -316,6 +316,30 @@ def analyze(prof=None):
         same = np.mean([len(set(R[l, 0, c, t]) & set(R[l, f, c, t])) / k
                         for l in range(L) for c in range(C) for t in range(T)])
         out.append(f"With {fmts[f]} experts, {same:.1%} of the routed experts are the same as with bf16.")
+    # MTP verification runs m consecutive tokens through each layer at once: weights are read once per step, so what
+    # matters is the union of their experts (card-resident and cold), measured here on the real routing.
+    if prof:
+        on = np.zeros(L * E, bool)
+        on[orders["Basalt's shipped profile"](0)[:caps["bfp8"]]] = True
+        out += ["\n### Experts per layer when m consecutive tokens are verified together (MTP)\n",
+                f"Mean over layers, texts and windows; placement = Basalt's profile with {caps['bfp8']:,} experts on the card.\n",
+                "| m tokens | unique experts | on card | cold (CPU) |", "|---:|---:|---:|---:|"]
+        win = {}
+        for m in (1, 2, 3, 4, 6, 8):
+            u = [np.unique(flat[l, c, t:t + m]) for l in range(L) for c in range(C) for t in range(0, T - m + 1, m)]
+            win[m] = (np.mean([len(x) for x in u]), np.mean([on[x].sum() for x in u]), np.mean([(~on[x]).sum() for x in u]))
+            out.append(f"| {m} | {win[m][0]:.1f} | {win[m][1]:.1f} | {win[m][2]:.1f} |")
+        ms = np.array(list(win))
+        # Basalt community medians (docs/community/benchmarks.json, 20 runs): draft length, acceptance per draft
+        scen = {"prose": (1.8, 0.6675), "chat": (2.35, 0.7285), "structured": (6.9, 0.9835)}
+        out += ["\nPredicted decode with MTP (E5-2690 v4, 64 GB), assuming Basalt's measured draft lengths and acceptance; "
+                "the experts per step are interpolated from the table above.\n",
+                "| Text kind | drafts / step | tokens / step | dense BFP8 | dense BFP4 |", "|---|---:|---:|---:|---:|"]
+        for kind, (dl, acc) in scen.items():
+            m = 1 + dl
+            hot, cold = (np.interp(m, ms, [win[x][i] for x in ms]) for i in (1, 2))
+            r = [plan.decode_mtp(host, hot, cold, m, 1 + dl * acc, d) for d in ("bfp8", "bfp4")]
+            out.append(f"| {kind} | {dl} | {1 + dl * acc:.2f} | {r[0]:.1f} t/s | {r[1]:.1f} t/s |")
     if prof and "metrics" in z:
         key = ("Basalt's shipped profile", chunks[0])
         out += ["\n### Predicted decode with the measured hit rate\n",
