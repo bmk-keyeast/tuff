@@ -191,8 +191,9 @@ def main():
         model = M.Qwen4ExpForCausalLM(cfg)
     tm = model.model
     tm.rotary_emb = M.Qwen4ExpTextRotaryEmbedding(cfg)                  # real inv_freq buffers
+    full = a.layers == cfg.num_hidden_layers
     tm.layers = tm.layers[: a.layers]
-    tm.config.num_hidden_layers = a.layers
+    tm.config.num_hidden_layers = a.layers                              # same object as cfg
     materialize(src, tm.hyper_connection_mixer, CK + "hyper_connection_mixer.")
     embeds = rows(src, CK + "embed_tokens.weight", batch_ids.reshape(-1).numpy()).reshape(Fn * C, T, -1)
 
@@ -227,7 +228,7 @@ def main():
 
     out = dict(routes=routes.reshape(a.layers, Fn, C, T, -1), chunks=np.array(chunks), fmts=np.array(fmts),
                ids=ids.numpy(), timing=np.array(timing))
-    if a.layers == cfg.num_hidden_layers:
+    if full:
         W = tensor(src, "lm_head.weight")
         metrics = np.zeros((Fn, C, 3))                                   # nll, kld, top-1 agreement (sums)
         for c in range(C):
@@ -247,5 +248,90 @@ def main():
     print(f"done in {out['wall_s'] / 60:.1f} min; {stats['experts']} expert fetches")
 
 
+def basalt_order(path, E):
+    """Basalt's shipped expert profile (data/profiles/qwen4exp-48x512.prof, MIT): u32 version, layers, experts, n,
+    slots; then n (u16 layer, u16 expert) pairs, best first; then a rank table. Returns flat layer*E+expert, best first."""
+    import struct
+    d = Path(path).read_bytes()
+    _, _, _, n, _ = struct.unpack("<5I", d[:20])
+    p = np.frombuffer(d[20:20 + 4 * n], "<u2").reshape(n, 2).astype(np.int64)
+    return p[:, 0] * E + p[:, 1]
+
+
+def analyze(prof=None):
+    import plan
+    z = np.load(ROOT / "results" / "routes.npz")
+    R = z["routes"].astype(np.int64)                                    # [L, F, C, T, k]
+    L, Fn, C, T, k = R.shape
+    E = plan.QFN["E"]
+    chunks, fmts = [str(c) for c in z["chunks"]], [str(f) for f in z["fmts"]]
+    ref = R[:, 0]                                                       # bf16 routing, [L, C, T, k]
+    flat = ref + (np.arange(L) * E)[:, None, None, None]                # global expert id layer*E+e
+    counts = np.stack([np.bincount(flat[:, c].ravel(), minlength=L * E) for c in range(C)])
+    host = plan.HOSTS["E5-2690v4, 4x16GB"]
+    caps = {d: plan.memory_map(d, "bfp4", 32768, host)["n_dev"] * L // plan.QFN["L"] for d in ("bfp8", "bfp4")}
+
+    def hit(order, n, c):
+        on = np.zeros(L * E, bool)
+        on[order[:n]] = True
+        return on[flat[:, c]].mean()
+
+    orders = {"in-sample (same text, upper bound)": lambda c: np.argsort(-counts[c], kind="stable")}
+    if C > 1:
+        orders["the other text's counts"] = lambda c: np.argsort(-counts[1 - c], kind="stable")
+    if prof:
+        b = basalt_order(prof, E)
+        b = b[b < L * E]                                                 # partial runs: the layers that ran
+        orders["Basalt's shipped profile"] = lambda c: b
+
+    out = ["## Qwen3.8-Flash-Next forward pass, streamed from the checkpoint\n",
+           f"{T} tokens of each text ({', '.join(chunks)}), {L} layers, batch = every (expert format, text) pair. "
+           f"Wall time {float(z['wall_s']) / 60:.0f} min on a GitHub runner.\n"]
+    if "metrics" in z:
+        m = z["metrics"]
+        out += ["### Accuracy of BFP experts (dense weights unquantized)\n",
+                "KLD and top-1 agreement are against the bf16 run on the same tokens.\n",
+                "| Text | Experts | PPL | KLD mean | Same top-1 |", "|---|---|---:|---:|---:|"]
+        for c, name in enumerate(chunks):
+            for f, fm in enumerate(fmts):
+                out.append(f"| {name} | {fm} | {np.exp(m[f, c, 0]):.3f} | "
+                           f"{'–' if f == 0 else f'{m[f, c, 1]:.4f}'} | {'–' if f == 0 else f'{100 * m[f, c, 2]:.2f}%'} |")
+    out += ["\n### Routing\n",
+            "Hit rate = share of the 10 routed experts per token and layer that a placement keeps on the card. Card capacity "
+            f"from plan.py: {caps['bfp8']:,} experts with dense weights in BFP8, {caps['bfp4']:,} with dense in BFP4 "
+            f"(of {L * E:,}).\n",
+            "| Placement | Text | " + " | ".join(f"hit, {n:,} on card" for n in caps.values()) + " |",
+            "|---|---|" + "---:|" * len(caps)]
+    out.append("| uniform | any | " + " | ".join(f"{n / (L * E):.1%}" for n in caps.values()) + " |")
+    hits = {}
+    for pname, fn in orders.items():
+        for c, name in enumerate(chunks):
+            hits[pname, name] = [hit(fn(c), n, c) for n in caps.values()]
+            out.append(f"| {pname} | {name} | " + " | ".join(f"{h:.1%}" for h in hits[pname, name]) + " |")
+    reuse = [np.mean([len(set(ref[l, c, t]) & set(ref[l, c, t - 1])) / k for l in range(L) for t in range(1, T)])
+             for c in range(C)]
+    out.append("\nShare of a token's experts that the previous token also used, same layer: " +
+               ", ".join(f"{n} {r:.1%}" for n, r in zip(chunks, reuse)) + ".")
+    for f in range(1, Fn):
+        same = np.mean([len(set(R[l, 0, c, t]) & set(R[l, f, c, t])) / k
+                        for l in range(L) for c in range(C) for t in range(T)])
+        out.append(f"With {fmts[f]} experts, {same:.1%} of the routed experts are the same as with bf16.")
+    if prof and "metrics" in z:
+        key = ("Basalt's shipped profile", chunks[0])
+        out += ["\n### Predicted decode with the measured hit rate\n",
+                f"plan.py's model with the hit rate measured for Basalt's profile on {chunks[0]} (E5-2690 v4, 64 GB, "
+                "batch 1, no MTP).\n", "| Dense on card | Hit rate | t/s |", "|---|---:|---:|"]
+        for (d, n), h in zip(caps.items(), hits[key]):
+            out.append(f"| {d} | {h:.1%} | {plan.decode(host, h, d)[0]:.1f} |")
+    text = "\n".join(out) + "\n"
+    (ROOT / "results" / "trace.md").write_text(text, encoding="utf-8")
+    print(text)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8")
+    if len(sys.argv) > 1 and sys.argv[1] == "analyze":
+        analyze(sys.argv[2] if len(sys.argv) > 2 else None)
+    else:
+        main()
