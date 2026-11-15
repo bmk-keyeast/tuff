@@ -51,12 +51,12 @@ int main(void) {
     /* exactly representable block: must round-trip bit-exactly (incl. negative and zero) */
     float w[16] = {1, -0.5f, 0.25f, 0.75f, 0, -1, 0.5f, -0.25f};   /* multiples of 1/4: exact in bfp4 too */
     for (int fmt = 0; fmt < 2; fmt++) {
-        bfp_mat m; float back[32];
-        bfp_alloc(&m, fmt ? BFP4 : BFP8, 16, 2);
-        float v[32] = {0};
-        for (int r = 0; r < 16; r++) v[r * 2] = w[r];    /* column 0 holds the block */
+        bfp_mat m; float back[128];
+        assert(bfp_alloc(&m, fmt ? BFP4 : BFP8, 16, 8) == 0);
+        float v[128] = {0};
+        for (int r = 0; r < 16; r++) v[r * 8] = w[r];    /* column 0 holds the block */
         bfp_pack(&m, v); bfp_unpack(&m, back);
-        for (int i = 0; i < 32; i++) assert(back[i] == v[i]);
+        for (int i = 0; i < 128; i++) assert(back[i] == v[i]);
         assert(m.exp[1] == 0);                           /* all-zero column -> exponent 0 */
         bfp_free(&m);
     }

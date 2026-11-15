@@ -8,14 +8,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # the phase-0 kernel is benchmarked as a fixed baseline
       - run: python plan.py > /dev/null
       - run: make -C kernels test
       - run: make -C kernels bench_bfp
+      - name: build phase-0 kernel (baseline)
+        run: |
+          mkdir /tmp/base && git show a5a7b99:kernels/bfp.c > /tmp/base/bfp.c && git show a5a7b99:kernels/bfp.h > /tmp/base/bfp.h
+          gcc -O3 -march=haswell -fopenmp -I/tmp/base kernels/bench_bfp.c /tmp/base/bfp.c -o /tmp/base/bench_bfp -lm
       - name: bench
         run: |
           lscpu | grep -E "Model name|^CPU\(s\)" > bench.txt
           echo "ISA: $(grep -o -w -E 'avx2|fma|avx512f|avx512_vnni' /proc/cpuinfo | sort -u | tr '\n' ' ')" >> bench.txt
-          for k in 10 6; do   # 10 = no experts on the card, 6 = uniform routing with ~40% on the card
-            for f in bfp4 bfp8; do OMP_NUM_THREADS=$(nproc) ./kernels/bench_bfp $k $f 2048 400 | tee -a bench.txt; done
+          for t in 1 $(nproc); do                # 1 thread = decode speed per core, nproc = memory-bound
+            for k in 10 6; do   # 10 = no experts on the card, 6 = uniform routing with ~40% on the card
+              for f in bfp4 bfp8; do
+                echo "base $(OMP_NUM_THREADS=$t /tmp/base/bench_bfp $k $f 2048 400)" | tee -a bench.txt
+                echo "new  $(OMP_NUM_THREADS=$t ./kernels/bench_bfp $k $f 2048 400)" | tee -a bench.txt
+              done
+            done
           done
           { echo '```'; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

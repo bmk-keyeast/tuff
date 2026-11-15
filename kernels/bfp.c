@@ -4,12 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int bpb(enum bfp_fmt f) { return f == BFP8 ? 16 : 8; }   /* mantissa bytes per block */
+static int bits(enum bfp_fmt f) { return f == BFP8 ? 8 : 4; }   /* stored bits per element */
 
-size_t bfp_mant_bytes(enum bfp_fmt fmt, int out, int in) { return (size_t)(out / 16) * in * bpb(fmt); }
+size_t bfp_mant_bytes(enum bfp_fmt fmt, int out, int in) { return (size_t)(out / 16) * in * 2 * bits(fmt); }
 
 int bfp_alloc(bfp_mat *m, enum bfp_fmt fmt, int out, int in) {
-    if (out % 16) return -1;
+    if (out % 16 || in % 8) return -1;
     m->fmt = fmt; m->out = out; m->in = in;
     /* 64-byte aligned so panels stream cleanly; sizes rounded up for aligned_alloc */
     size_t ne = (size_t)(out / 16) * in, nm = bfp_mant_bytes(fmt, out, in);
@@ -27,38 +27,43 @@ static inline float pow2i(int e) {
     return v.f;
 }
 
+/* the dword holding W[16p+r][j], and the field's bit offset in it (layout in bfp.h) */
+static inline uint32_t *slot(const bfp_mat *m, int p, int j, int r, int *sh) {
+    int b = bits(m->fmt), c = 32 / b;
+    *sh = b * (j % c);
+    return (uint32_t *)m->mant + (((size_t)p * (m->in / c) + j / c) * 2 + r / 8) * 8 + r % 8;
+}
+
 void bfp_pack(bfp_mat *m, const float *w) {
-    const int mb = m->fmt, qmax = (1 << mb) - 1, P = m->out / 16;
+    const int mb = m->fmt, qmax = (1 << mb) - 1, off = qmax + 1, P = m->out / 16;
+    memset(m->mant, 0, bfp_mant_bytes(m->fmt, m->out, m->in));
     for (int p = 0; p < P; p++)
         for (int j = 0; j < m->in; j++) {
-            float a = 0;
+            float a = 0, step = 0;
             for (int r = 0; r < 16; r++) a = fmaxf(a, fabsf(w[(size_t)(16 * p + r) * m->in + j]));
             size_t b = (size_t)p * m->in + j;
-            uint8_t *dst = m->mant + b * bpb(m->fmt);
-            if (a == 0 || !isfinite(a)) { m->exp[b] = 0; memset(dst, 0, bpb(m->fmt)); continue; }
-            int e = ilogbf(a);                       /* floor(log2(a)) */
-            if (e < mb - 126) e = mb - 126;          /* keep the scale a normal float (tiny blocks flush) */
-            if (e > 127) e = 127;
-            m->exp[b] = (uint8_t)(e + 127);
-            float step = pow2i(e - (mb - 1));
-            if (m->fmt == BFP4) memset(dst, 0, 8);
+            m->exp[b] = 0;                           /* all-zero (or non-finite) block */
+            if (a != 0 && isfinite(a)) {
+                int e = ilogbf(a);                   /* floor(log2(a)) */
+                if (e < mb - 126) e = mb - 126;      /* keep the scale a normal float (tiny blocks flush) */
+                if (e > 127) e = 127;
+                m->exp[b] = (uint8_t)(e + 127);
+                step = pow2i(e - (mb - 1));
+            }
             for (int r = 0; r < 16; r++) {
                 float v = w[(size_t)(16 * p + r) * m->in + j];
-                int q = (int)floorf(fabsf(v) / step + 0.5f);
+                int q = step ? (int)floorf(fabsf(v) / step + 0.5f) : 0, sh;
                 if (q > qmax) q = qmax;
-                int s = v < 0 && q;                  /* no negative zero */
-                if (m->fmt == BFP8) dst[r] = (uint8_t)(s << 7 | q);
-                else dst[r >> 1] |= (uint8_t)((s << 3 | q) << (4 * (r & 1)));
+                uint32_t *d = slot(m, p, j, r, &sh);     /* sets sh: must happen before the shift */
+                *d |= (uint32_t)(off + (v < 0 ? -q : q)) << sh;
             }
         }
 }
 
-static inline int elem(const bfp_mat *m, size_t b, int r) {
-    const uint8_t *src = m->mant + b * bpb(m->fmt);
-    int v, s;
-    if (m->fmt == BFP8) { v = src[r] & 0x7f; s = src[r] >> 7; }
-    else { int n = (src[r >> 1] >> (4 * (r & 1))) & 0xf; v = n & 7; s = n >> 3; }
-    return s ? -v : v;
+static inline int elem(const bfp_mat *m, int p, int j, int r) {
+    int sh, b = bits(m->fmt);
+    uint32_t d = *slot(m, p, j, r, &sh);
+    return (int)((d >> sh) & ((1u << b) - 1)) - (1 << (b - 1));
 }
 
 static inline float scale_of(const bfp_mat *m, size_t b) {
@@ -68,9 +73,8 @@ static inline float scale_of(const bfp_mat *m, size_t b) {
 void bfp_unpack(const bfp_mat *m, float *w) {
     for (int p = 0; p < m->out / 16; p++)
         for (int j = 0; j < m->in; j++) {
-            size_t b = (size_t)p * m->in + j;
-            float sc = scale_of(m, b);
-            for (int r = 0; r < 16; r++) w[(size_t)(16 * p + r) * m->in + j] = sc * elem(m, b, r);
+            float sc = scale_of(m, (size_t)p * m->in + j);
+            for (int r = 0; r < 16; r++) w[(size_t)(16 * p + r) * m->in + j] = sc * elem(m, p, j, r);
         }
 }
 
@@ -78,71 +82,67 @@ void bfp_gemv_ref(const bfp_mat *m, const float *x, float *y) {
     for (int p = 0; p < m->out / 16; p++) {
         float acc[16] = {0};
         for (int j = 0; j < m->in; j++) {
-            size_t b = (size_t)p * m->in + j;
-            float s = x[j] * scale_of(m, b);
-            for (int r = 0; r < 16; r++) acc[r] += s * elem(m, b, r);
+            float s = x[j] * scale_of(m, (size_t)p * m->in + j);
+            for (int r = 0; r < 16; r++) acc[r] += s * elem(m, p, j, r);
         }
         memcpy(y + 16 * p, acc, sizeof acc);
     }
 }
 
-/* 16 sign-magnitude int8 -> two __m256 floats */
-static inline void sm8_to_ps(__m128i b, __m256 *lo, __m256 *hi) {
-    __m128i sign = _mm_cmpgt_epi8(_mm_setzero_si128(), b);            /* 0xff where bit7 set */
-    __m128i mag = _mm_and_si128(b, _mm_set1_epi8(0x7f));
-    __m128i v = _mm_sub_epi8(_mm_xor_si128(mag, sign), sign);          /* conditional negate */
-    *lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v));
-    *hi = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v, 8)));
+static inline float hsum(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    return _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s)));
 }
 
-/* block j of a panel -> 16 signed values as two __m256 */
-static inline void load16(enum bfp_fmt fmt, const uint8_t *mt, int j, __m256 *lo, __m256 *hi) {
-    if (fmt == BFP8) { sm8_to_ps(_mm_loadu_si128((const __m128i *)(mt + 16 * (size_t)j)), lo, hi); return; }
-    /* nibble (sign<<3 | mag) -> signed int8 via pshufb */
-    const __m128i lut = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 0, -1, -2, -3, -4, -5, -6, -7);
-    const __m128i lo4 = _mm_set1_epi8(0x0f);
-    __m128i b = _mm_loadl_epi64((const __m128i *)(mt + 8 * (size_t)j));
-    __m128i v = _mm_shuffle_epi8(lut, _mm_unpacklo_epi8(_mm_and_si128(b, lo4), _mm_and_si128(_mm_srli_epi16(b, 4), lo4)));
-    *lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v));
-    *hi = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v, 8)));
-}
+/* field k (b bits wide) of every dword in v, as int32; the first and last fields need one op, not two */
+#define FIELD(v, k, b, mask) ((k) == 0 ? _mm256_and_si256(v, mask)                          \
+                              : (k) == 32 / (b) - 1 ? _mm256_srli_epi32(v, 32 - (b))        \
+                              : _mm256_and_si256(_mm256_srli_epi32(v, (b) * (k)), mask))
+/* column k of the group: 8 rows (lo) + 8 rows (hi) += a[j] * n */
+#define STEP(k, b, L, H) {                                                                  \
+    __m256 s = _mm256_broadcast_ss(ag + (k));                                               \
+    L = _mm256_fmadd_ps(s, _mm256_cvtepi32_ps(FIELD(lo, k, b, mask)), L);                   \
+    H = _mm256_fmadd_ps(s, _mm256_cvtepi32_ps(FIELD(hi, k, b, mask)), H); }
 
-/* exponent byte -> block scale, per format; scale[0] = 0 handles all-zero blocks without a branch */
-static float scale8[256], scale4[256];
-__attribute__((constructor)) static void init_scales(void) {
-    for (int e = 1; e < 256; e++) {
-        scale8[e] = e - 127 - 6 >= -126 ? pow2i(e - 127 - 6) : 0.f;
-        scale4[e] = e - 127 - 2 >= -126 ? pow2i(e - 127 - 2) : 0.f;
-    }
-}
-
-/* one 16-row panel: y16 = W[16p:16p+16] x. Two blocks per iteration into four accumulators,
- * so consecutive FMAs are independent (a single chain is bound by FMA latency, 5 cycles on Broadwell). */
+/* One 16-row panel: y16 = W[16p:16p+16] x.
+ * Pass 1, 8 columns per step: a[j] = x[j] * 2^(block exponent), built from the exponent bits; A = sum a[j].
+ * Pass 2: a 256-bit load is 8 rows x one column group; each field is an unsigned n = value + off, so it
+ * decodes with shift + and + int->float (no shuffles, which all queue on port 5 on Broadwell) and the
+ * offset is removed once per row at the end: y = sum a[j] n - off * A. */
 static inline void panel(const bfp_mat *m, int p, const float *x, float *y16) {
-    const int in = m->in;
-    const float *sc = m->fmt == BFP8 ? scale8 : scale4;
+    const int in = m->in, mb = m->fmt;
+    float a[in];
     const uint8_t *e = m->exp + (size_t)p * in;
-    const uint8_t *mt = m->mant + (size_t)p * in * bpb(m->fmt);
-    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, lo, hi;
-    int j = 0;
-    for (; j + 1 < in; j += 2) {
-        load16(m->fmt, mt, j, &lo, &hi);
-        __m256 s = _mm256_set1_ps(x[j] * sc[e[j]]);
-        a0 = _mm256_fmadd_ps(s, lo, a0);
-        a1 = _mm256_fmadd_ps(s, hi, a1);
-        load16(m->fmt, mt, j + 1, &lo, &hi);
-        s = _mm256_set1_ps(x[j + 1] * sc[e[j + 1]]);
-        a2 = _mm256_fmadd_ps(s, lo, a2);
-        a3 = _mm256_fmadd_ps(s, hi, a3);
+    const __m256i bias = _mm256_set1_epi32(mb - 1);
+    __m256 As = _mm256_setzero_ps();
+    for (int j = 0; j < in; j += 8) {
+        __m256i ev = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(e + j)));
+        __m256i sb = _mm256_and_si256(_mm256_cmpgt_epi32(ev, bias),          /* exp 0 -> scale 0 */
+                                      _mm256_slli_epi32(_mm256_sub_epi32(ev, bias), 23));
+        __m256 v = _mm256_mul_ps(_mm256_loadu_ps(x + j), _mm256_castsi256_ps(sb));
+        _mm256_storeu_ps(a + j, v);
+        As = _mm256_add_ps(As, v);
     }
-    if (j < in) {
-        load16(m->fmt, mt, j, &lo, &hi);
-        __m256 s = _mm256_set1_ps(x[j] * sc[e[j]]);
-        a0 = _mm256_fmadd_ps(s, lo, a0);
-        a1 = _mm256_fmadd_ps(s, hi, a1);
+    const __m256i *mt = (const __m256i *)(m->mant + (size_t)p * in * 2 * bits(m->fmt));
+    __m256 l0 = _mm256_setzero_ps(), l1 = l0, l2 = l0, l3 = l0, h0 = l0, h1 = l0, h2 = l0, h3 = l0;
+    if (m->fmt == BFP4) {
+        const __m256i mask = _mm256_set1_epi32(0xf);
+        for (const float *ag = a; ag < a + in; ag += 8, mt += 2) {
+            __m256i lo = _mm256_loadu_si256(mt), hi = _mm256_loadu_si256(mt + 1);
+            STEP(0, 4, l0, h0) STEP(1, 4, l1, h1) STEP(2, 4, l2, h2) STEP(3, 4, l3, h3)
+            STEP(4, 4, l0, h0) STEP(5, 4, l1, h1) STEP(6, 4, l2, h2) STEP(7, 4, l3, h3)
+        }
+    } else {
+        const __m256i mask = _mm256_set1_epi32(0xff);
+        for (const float *ag = a; ag < a + in; ag += 4, mt += 2) {
+            __m256i lo = _mm256_loadu_si256(mt), hi = _mm256_loadu_si256(mt + 1);
+            STEP(0, 8, l0, h0) STEP(1, 8, l1, h1) STEP(2, 8, l2, h2) STEP(3, 8, l3, h3)
+        }
     }
-    _mm256_storeu_ps(y16, _mm256_add_ps(a0, a2));
-    _mm256_storeu_ps(y16 + 8, _mm256_add_ps(a1, a3));
+    __m256 corr = _mm256_set1_ps(-(float)(1 << mb) * hsum(As));
+    _mm256_storeu_ps(y16, _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(l0, l1), _mm256_add_ps(l2, l3)), corr));
+    _mm256_storeu_ps(y16 + 8, _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(h0, h1), _mm256_add_ps(h2, h3)), corr));
 }
 
 void bfp_gemv(const bfp_mat *m, const float *x, float *y) {
@@ -152,7 +152,7 @@ void bfp_gemv(const bfp_mat *m, const float *x, float *y) {
 
 /* One MoE layer for one token: y = sum_i gate[i] * expert_i(x) over k selected experts.
  * A single parallel region over (expert, panel) pairs: per-GEMV fork/join would cost more than the
- * GEMV itself at expert sizes (a 768x2048 bfp4 matrix is ~0.9 MB, ~15 us of DRAM time).
+ * GEMV itself at expert sizes (a 640x2560 bfp4 matrix is ~0.9 MB, ~15 us of DRAM time).
  * tmp: k * (2*I + d) floats. */
 void moe_forward(const bfp_mat *const *w1, const bfp_mat *const *w3, const bfp_mat *const *w2,
                  const float *gate, int k, const float *x, float *y, float *tmp) {
