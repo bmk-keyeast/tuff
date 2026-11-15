@@ -20,6 +20,7 @@ import json
 import struct
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -35,8 +36,17 @@ class Source:
 
     def __init__(self, root="hf"):
         self.root = None if root == "hf" else Path(root)
+        self.urls, self.headers = {}, {}
         self.map = json.loads(self._get("model.safetensors.index.json"))["weight_map"]
-        self.headers = {}
+
+    def _url(self, f):
+        """The signed CDN URL Hugging Face redirects to, reused for range requests (one redirect per file, not per read)."""
+        u, t = self.urls.get(f, (None, 0))
+        if u is None or time.time() - t > 1800:
+            with urllib.request.urlopen(urllib.request.Request(REPO + f, headers={"Range": "bytes=0-0"}), timeout=60) as r:
+                u = r.geturl()
+            self.urls[f] = (u, time.time())
+        return u
 
     def _get(self, f, start=None, end=None):   # end inclusive
         if self.root:
@@ -45,33 +55,57 @@ class Source:
                     return fh.read()
                 fh.seek(start)
                 return fh.read(end - start + 1)
-        req = urllib.request.Request(REPO + f, headers={} if start is None else {"Range": f"bytes={start}-{end}"})
-        for attempt in range(5):
+        for attempt in range(6):
             try:
+                if start is None:
+                    req = urllib.request.Request(REPO + f)
+                else:
+                    req = urllib.request.Request(self._url(f), headers={"Range": f"bytes={start}-{end}"})
                 with urllib.request.urlopen(req, timeout=300) as r:
                     data = r.read()
                 if start is None or len(data) == end - start + 1:
                     return data
             except OSError:
-                if attempt == 4:
+                self.urls.pop(f, None)               # expired signature or a network blip: re-resolve
+                if attempt == 5:
                     raise
             time.sleep(2 ** attempt)
         raise IOError(f"short read: {f} {start}-{end}")
 
-    def expert(self, name, e):
-        """Expert e of a fused [E, out, in] BF16 tensor, as float32 [out, in]."""
+    def info(self, name):
+        """(file, absolute byte offset, header entry) of a tensor."""
         f = self.map[name]
         if f not in self.headers:
             n = struct.unpack("<Q", self._get(f, 0, 7))[0]
             self.headers[f] = (8 + n, json.loads(self._get(f, 8, 7 + n)))
         base, h = self.headers[f]
-        t = h[name]
+        return f, base + h[name]["data_offsets"][0], h[name]
+
+    def read(self, f, start, size, parts=8):
+        """size bytes at start, in parallel range requests of >= 64 MB."""
+        n = max(1, min(parts, size >> 26))
+        cuts = [start + size * i // n for i in range(n + 1)]
+        if n == 1:
+            return self._get(f, start, start + size - 1)
+        with ThreadPoolExecutor(n) as ex:
+            return b"".join(ex.map(lambda i: self._get(f, cuts[i], cuts[i + 1] - 1), range(n)))
+
+    def raw(self, name):
+        """A whole tensor: (bytes, dtype string, shape)."""
+        f, start, t = self.info(name)
+        return self.read(f, start, t["data_offsets"][1] - t["data_offsets"][0]), t["dtype"], t["shape"]
+
+    def expert_bf16(self, name, e):
+        """Expert e of a fused [E, out, in] BF16 tensor, as raw little-endian uint16 [out, in]."""
+        f, start, t = self.info(name)
         assert t["dtype"] == "BF16" and len(t["shape"]) == 3, (name, t["dtype"], t["shape"])
         _, out, inn = t["shape"]
         size = out * inn * 2
-        start = base + t["data_offsets"][0] + e * size
-        u = np.frombuffer(self._get(f, start, start + size - 1), dtype="<u2")
-        return (u.astype(np.uint32) << 16).view(np.float32).reshape(out, inn)
+        return np.frombuffer(self.read(f, start + e * size, size), dtype="<u2").reshape(out, inn)
+
+    def expert(self, name, e):
+        """Expert e of a fused [E, out, in] BF16 tensor, as float32 [out, in]."""
+        return (self.expert_bf16(name, e).astype(np.uint32) << 16).view(np.float32)
 
 
 def quantize(w, fmt):

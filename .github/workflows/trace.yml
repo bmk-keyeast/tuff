@@ -1,0 +1,36 @@
+# Real Qwen3.8-Flash-Next forward pass, streamed from the Hugging Face checkpoint layer by layer (trace.py), then the
+# routing / placement / accuracy analysis. A full run reads ~240 GB of experts over HTTP and takes a few hours.
+name: trace
+on:
+  workflow_dispatch:
+    inputs:
+      tokens: { description: "tokens per text", default: "1024" }
+      layers: { description: "decoder layers to run (48 = full model + analysis)", default: "48" }
+
+permissions:
+  contents: write
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q "transformers==5.23.0" numpy pyarrow
+      - run: curl -sfLo basalt.prof https://raw.githubusercontent.com/jesdga95/basalt/main/data/profiles/qwen4exp-48x512.prof
+      - run: python -u trace.py --tokens "${{ inputs.tokens }}" --layers "${{ inputs.layers }}"
+      - if: inputs.layers == '48'
+        run: python trace.py analyze basalt.prof | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: routes, path: results/routes.npz, if-no-files-found: ignore }
+      - name: commit results
+        if: inputs.layers == '48'
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add results/trace.md results/routes.npz
+          git commit -m "trace: real QFN forward pass, ${{ inputs.tokens }} tokens per text"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done; exit 1
