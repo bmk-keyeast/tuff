@@ -273,7 +273,7 @@ def check(T=40, seed=0):
             pooled = ix.k_layernorm(raw[:nb * 4].view(nb, 4, -1).mean(1))
             starts = torch.arange(nb) * 4
             bk = apply_rotary_pos_emb(pooled.unsqueeze(1), cos=cos[0].index_select(0, starts), sin=sin[0].index_select(0, starts)).squeeze(1)
-            sc = (torch.relu(q[0, t] @ bk.T).sum(0) / math.sqrt(ix.index_head_dim)).numpy()
+            sc = (torch.relu(q[0, t] @ bk.T).sum(0) / math.sqrt(ix.index_head_dim)).detach().numpy()
             print("transformers scores", sc, "ref.py scores", ref.scores[L, t])
             break
     err = np.abs(got - want).max(1) / np.abs(want).max(1)
