@@ -26,7 +26,7 @@ bfp_host.o: bfp.c bfp.h
 test_cuda: test_cuda.cu bfp_cuda.cu bfp_cuda.h bfp_host.o
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -Xcompiler -fopenmp test_cuda.cu bfp_cuda.cu bfp_host.o -o $@ -lgomp -lm
 
-test: test_bfp test_cache
+test: test_bfp test_cache test_store
 	OMP_NUM_THREADS=4 ./test_bfp
 	./test_cache
 
