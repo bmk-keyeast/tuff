@@ -1,6 +1,6 @@
 ## Qwen3.8-Flash-Next forward pass, streamed from the checkpoint
 
-1024 tokens of each text (wikitext, code), 48 layers, batch = every (expert format, text) pair. Wall time 65 min on a GitHub runner.
+1024 tokens of each text (wikitext, code), 48 layers, batch = every (expert format, text) pair. Wall time 28 min on a GitHub runner.
 
 ### Accuracy per format
 
@@ -9,23 +9,13 @@ bf16 = checkpoint weights. tuff = every dense projection and the LM head in BFP8
 | Text | Format | Dense on card | PPL | KLD mean | Same top-1 |
 |---|---|---:|---:|---:|---:|
 | wikitext | bf16 | bf16 | 1.613 | – | – |
-| wikitext | tuff | 4.57 GB | 1.675 | 0.0866 | 93.94% |
-| wikitext | lin_qkv | 4.10 GB | 1.736 | 0.1283 | 92.77% |
-| wikitext | lin_z | 4.29 GB | 1.699 | 0.1043 | 93.55% |
-| wikitext | lin_out | 4.29 GB | 1.709 | 0.1510 | 91.79% |
-| wikitext | full | 4.26 GB | 1.843 | 0.2480 | 88.86% |
-| wikitext | shared | 4.45 GB | 1.683 | 0.1147 | 93.06% |
-| wikitext | hc | 4.25 GB | 1.724 | 0.1303 | 92.28% |
-| wikitext | lm_head | 4.25 GB | 1.687 | 0.0947 | 92.77% |
+| wikitext | tuff | 4.57 GB | 1.674 | 0.0863 | 93.94% |
+| wikitext | tuff-mix | 3.97 GB | 1.716 | 0.1131 | 92.38% |
+| wikitext | tuff-mix2 | 3.50 GB | 1.747 | 0.1307 | 91.98% |
 | code | bf16 | bf16 | 2.057 | – | – |
-| code | tuff | 4.57 GB | 2.086 | 0.0510 | 95.31% |
-| code | lin_qkv | 4.10 GB | 2.077 | 0.0614 | 93.94% |
-| code | lin_z | 4.29 GB | 2.078 | 0.0528 | 95.41% |
-| code | lin_out | 4.29 GB | 2.101 | 0.0825 | 93.55% |
-| code | full | 4.26 GB | 2.077 | 0.1239 | 92.77% |
-| code | shared | 4.45 GB | 2.083 | 0.0561 | 95.01% |
-| code | hc | 4.25 GB | 2.114 | 0.0659 | 94.33% |
-| code | lm_head | 4.25 GB | 2.096 | 0.0575 | 94.53% |
+| code | tuff | 4.57 GB | 2.086 | 0.0507 | 95.41% |
+| code | tuff-mix | 3.97 GB | 2.090 | 0.0597 | 94.53% |
+| code | tuff-mix2 | 3.50 GB | 2.082 | 0.0733 | 93.94% |
 
 ### Routing
 
@@ -42,14 +32,9 @@ Hit rate = share of the 10 routed experts per token and layer that a placement k
 | Basalt's shipped profile | code | 32.7% | 37.0% |
 
 Share of a token's experts that the previous token also used, same layer: wikitext 40.9%, code 36.8%.
-With tuff experts, 92.7% of the routed experts are the same as with bf16.
-With lin_qkv experts, 91.1% of the routed experts are the same as with bf16.
-With lin_z experts, 92.3% of the routed experts are the same as with bf16.
-With lin_out experts, 89.6% of the routed experts are the same as with bf16.
-With full experts, 88.0% of the routed experts are the same as with bf16.
-With shared experts, 92.1% of the routed experts are the same as with bf16.
-With hc experts, 90.4% of the routed experts are the same as with bf16.
-With lm_head experts, 92.7% of the routed experts are the same as with bf16.
+With tuff experts, 92.8% of the routed experts are the same as with bf16.
+With tuff-mix experts, 92.3% of the routed experts are the same as with bf16.
+With tuff-mix2 experts, 90.8% of the routed experts are the same as with bf16.
 
 ### Adaptive card cache (simulated on the trace)
 
@@ -81,7 +66,11 @@ Adaptive cache with up to 25 copies per token, hit rate measured on 'wikitext th
 | Host | Dense on card | Hit rate | no MTP | prose | chat | structured |
 |---|---|---:|---:|---:|---:|---:|
 | E5-2690v4, 4x16GB | bfp8 | 89.7% | 37.0 | 59.3 | 67.8 | 125.7 |
+| E5-2690v4, 4x16GB | tuff-mix | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 |
+| E5-2690v4, 4x16GB | tuff-mix2 | 90.4% | 45.3 | 70.6 | 80.5 | 147.6 |
 | 8259CL, 6x32GB | bfp8 | 89.7% | 37.2 | 60.2 | 69.0 | 130.1 |
+| 8259CL, 6x32GB | tuff-mix | 90.1% | 41.3 | 67.3 | 77.3 | 147.6 |
+| 8259CL, 6x32GB | tuff-mix2 | 90.4% | 45.3 | 71.9 | 82.2 | 153.6 |
 
 ### Predicted decode with the measured hit rate
 
@@ -99,10 +88,3 @@ Each row is tuff with one dense group in BFP4 instead of BFP8; ΔKLD and Δtop-1
 | Group | Params | Card GB saved | ΔKLD | Δ top-1 | Cumulative ΔKLD | Cumulative t/s |
 |---|---:|---:|---:|---:|---:|---:|
 | (tuff: all BFP8) | | | | | 0 | 37.0 |
-| lm_head | 636M | 0.32 | +0.0073 | -0.98 pt | 0.0073 | 39.2 |
-| lin_z | 566M | 0.28 | +0.0098 | -0.15 pt | 0.0171 | 41.3 |
-| lin_qkv | 944M | 0.47 | +0.0261 | -1.27 pt | 0.0431 | 45.3 |
-| hc | 629M | 0.31 | +0.0293 | -1.32 pt | 0.0725 | 48.4 |
-| shared | 236M | 0.12 | +0.0166 | -0.59 pt | 0.0890 | 49.6 |
-| lin_out | 566M | 0.28 | +0.0480 | -1.96 pt | 0.1370 | 53.0 |
-| full | 617M | 0.31 | +0.1171 | -3.81 pt | 0.2541 | 57.2 |
