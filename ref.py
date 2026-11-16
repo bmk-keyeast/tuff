@@ -63,8 +63,7 @@ class Ref:
         self.eos = c.eos_token_id[0] if isinstance(c.eos_token_id, list) else c.eos_token_id
         self.t = 0
         self.tokens = []
-        self.selected = {}                                                     # (layer, position) -> attended tokens
-        self.scores = {}
+        self.tie_break, self.ties = None, 0      # (layer, position) -> block ids, for ties at the top-k cutoff
         self.state = {}
         for L, kind in enumerate(c.layer_types[:c.num_hidden_layers]):
             if kind == "linear_attention":
@@ -135,10 +134,15 @@ class Ref:
             bk = np.stack([self.rope(b, i * ratio) for i, b in
                            enumerate(rms(blocks, self.w[p + ".indexer.k_layernorm.weight"], self.eps))])
             score = np.maximum(iq @ bk.T, 0).sum(0) / math.sqrt(ihd)
-            self.scores[L, t] = score
-            top = np.argsort(-score, kind="stable")[:min(c.indexer_budget // ratio, nb)]
+            n_top = min(c.indexer_budget // ratio, nb)
+            order = np.argsort(-score, kind="stable")
+            top = order[:n_top]
+            if n_top < nb and score[order[n_top - 1]] == score[order[n_top]] and self.tie_break:
+                # equal scores at the cutoff (in practice blocks whose ReLU'd score is exactly 0): transformers
+                # inherits torch.topk's unspecified order there, so the check borrows its pick
+                top = self.tie_break(L, t)
+                self.ties += 1
             keep = sorted(i * ratio + r for i in top for r in range(ratio)) + keep
-        self.selected[L, t] = keep
         qg = self.lin(p + ".q_proj", x).reshape(H, 2 * hd)
         q, gate = qg[:, :hd], qg[:, hd:]
         q = self.rope(rms(q, self.w[p + ".q_norm.weight"], self.eps), t)
@@ -245,40 +249,20 @@ def check(T=40, seed=0):
         else:
             p.data = (0.3 if p.ndim == 1 else 1 / math.sqrt(p.shape[-1])) * torch.randn(p.shape, generator=g)
     ids = torch.randint(0, cfg.vocab_size, (1, T), generator=g)
-    masks, args_seen = {}, {}
+    masks = {}
     for L, layer in enumerate(model.layers):
         if hasattr(layer, "self_attn"):
             layer.self_attn.indexer.register_forward_hook(lambda m, a, o, L=L: masks.__setitem__(L, o[0, 0].numpy()))
-            layer.self_attn.indexer.register_forward_pre_hook(lambda m, a, L=L: args_seen.__setitem__(L, a[:3]))
     with torch.no_grad():
         want = model(input_ids=ids, use_cache=False).last_hidden_state[0].double().numpy()
+    ratio = cfg.indexer_compress_ratio
     ref = Ref({k: v.numpy() for k, v in model.state_dict().items()}, cfg)
+    ref.tie_break = lambda L, t: sorted({i // ratio for i in np.flatnonzero(masks[L][t][:(t + 1) // ratio * ratio])})
     got = np.stack([ref.step(int(t)) for t in ids[0]])
-    for (L, t), keep in sorted(ref.selected.items(), key=lambda x: (x[0][1], x[0][0])):
-        hf = sorted(np.flatnonzero(masks[L][t][:t + 1]).tolist())
-        if hf != sorted(keep):
-            print(f"indexer differs first at layer {L}, token {t}: transformers keeps {hf}, ref.py keeps {sorted(keep)}")
-            # DEBUG: recompute transformers' block scores with its own modules on its own inputs
-            hs, pe, am = args_seen[L]
-            ix = model.layers[L].self_attn.indexer
-            from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
-            qk = ix.index_qk_proj(hs)
-            q, tk = torch.split(qk, [ix.index_n_heads * ix.index_head_dim, ix.index_kv_heads * ix.index_head_dim], -1)
-            q = ix.q_layernorm(q.reshape(1, T, -1, ix.index_head_dim))
-            cos, sin = pe
-            print("cos shape", tuple(cos.shape), "mask", am.dtype, tuple(am.shape))
-            q = apply_rotary_pos_emb(q, cos=cos, sin=sin, unsqueeze_dim=2)
-            raw = tk.reshape(1, T, -1, ix.index_head_dim).squeeze(2)[0]
-            nb = (t + 1) // 4
-            pooled = ix.k_layernorm(raw[:nb * 4].view(nb, 4, -1).mean(1))
-            starts = torch.arange(nb) * 4
-            bk = apply_rotary_pos_emb(pooled.unsqueeze(1), cos=cos[0].index_select(0, starts), sin=sin[0].index_select(0, starts)).squeeze(1)
-            sc = (torch.relu(q[0, t] @ bk.T).sum(0) / math.sqrt(ix.index_head_dim)).detach().numpy()
-            print("transformers scores", sc, "ref.py scores", ref.scores[L, t])
-            break
     err = np.abs(got - want).max(1) / np.abs(want).max(1)
     print(f"ref.py decode == transformers prefill: {T} tokens, {cfg.num_hidden_layers} layers "
-          f"({cfg.layer_types.count('linear_attention')} DeltaNet, PLE before layer {cfg.ple_layer_ids[0] - 1}), "
+          f"({cfg.layer_types.count('linear_attention')} DeltaNet, PLE before layer {cfg.ple_layer_ids[0] - 1}; "
+          f"{ref.ties} indexer ties at the top-k cutoff took transformers' pick), "
           f"max relative error {err.max():.1e}")
     assert err.max() < 1e-4, err
 
