@@ -8,11 +8,10 @@ picked, the N-gram table and the token embeddings only for the rows the text nee
 
 The batch holds every (format, text) pair, so one pass over the weights measures all of them:
   bf16       reference (checkpoint precision; dense weights run in fp32)
-  bfp4       routed experts in TT bfp4_b, dense weights as in the checkpoint
-  tuff       tuff's default card: dense projections and LM head in bfp8_b, routed experts in bfp4_b
-  tuff-fast  dense projections in bfp4_b, LM head bfp8_b, routed experts bfp4_b
-(router, norms, convolutions and the 1- and 4-row gates stay unquantized), and, from the bf16 rows, the routing
-trace: which experts each token uses at each layer.
+  tuff       tuff's default card: every dense projection and the LM head in bfp8_b, routed experts in bfp4_b
+  <group>    tuff with one dense group (plan.DENSE: lin_qkv, full, hc, ...) in bfp4_b, to find which groups tolerate it
+(norms, convolutions and the 1- and 4-row gates stay unquantized), and, from the bf16 rows, the routing trace: which
+experts each token uses at each layer.
 
 Outputs: perplexity of each format (the bf16 one checks this harness against the published model), KL divergence and
 top-1 agreement against bf16, routing statistics, and how often a token's experts would be on the card for a given
@@ -28,12 +27,26 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import plan
 from loader import Source
 
 REPO_ID = "Qwen/Qwen3.8-Flash-Next"
 CK = "model.language_model."                  # checkpoint prefix of the text model
-FORMATS = {"bf16": (None, None, None), "bfp4": (None, 3, 3), "tuff": (7, 3, 3), "tuff-fast": (3, 3, 3)}
-# mantissa bits for (dense projections, expert gate_up, expert down); None = unquantized. LM head: bfp8 when dense is.
+ABLATE = ("lin_qkv", "lin_z", "lin_out", "full", "shared", "hc", "lm_head")
+FORMATS = {"bf16": (None, None, None), "tuff": ({}, 3, 3), **{g: ({g: "bfp4"}, 3, 3) for g in ABLATE}}
+# (dense format: None = unquantized, else plan.fmt_of's {group: format} on top of bfp8; expert gate_up and down
+# mantissa bits, None = unquantized)
+MB = {"bfp8": 7, "bfp4": 3}
+# nn.Linear name inside a decoder layer -> plan.DENSE group; first match wins
+PATTERN = {"lin_qkv": "linear_attn.in_proj_qkv", "lin_z": "linear_attn.in_proj_z", "lin_out": "linear_attn.out_proj",
+           "lin_misc": "linear_attn.", "full": "self_attn.", "shared": "shared_expert.", "router": "mlp.gate",
+           "hc": "hyper_connection."}
+
+
+def dense_mb(spec, name):
+    if spec is None:
+        return None
+    return MB[plan.fmt_of(spec, next(g for g, s in PATTERN.items() if s in name))]   # StopIteration: unknown layer
 DT = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16, "I64": torch.int64, "I32": torch.int32}
 ROOT = Path(__file__).parent
 
@@ -115,15 +128,16 @@ def materialize(src, module, ck_prefix, skip=()):
             put(module, n, t)
 
 
-def split_linears(module, row_bits):
+def split_linears(module, row_specs):
     """Every nn.Linear in `module` (dense projections; the routed experts are not nn.Linear) gets one weight per
-    format: batch row b multiplies by its weight quantized to row_bits[b] (None = as loaded). Layers whose shape is
-    not whole 16-row blocks (the 1- and 4-output gates) stay unquantized."""
-    n_rows = len(row_bits)
-    for lin in module.modules():
+    format: batch row b multiplies by its weight quantized as dense format row_specs[b] says (None = as loaded).
+    Layers whose shape is not whole 16-row blocks (the 1- and 4-output gates) stay unquantized."""
+    n_rows = len(row_specs)
+    for name, lin in module.named_modules():
         if not isinstance(lin, torch.nn.Linear) or lin.out_features % 16 or lin.in_features % 8:
             continue
         assert lin.bias is None
+        row_bits = [dense_mb(s, name) for s in row_specs]
         groups = [(torch.tensor([b for b in range(n_rows) if row_bits[b] == bits]),
                    lin.weight if bits is None else bfp(lin.weight, bits)) for bits in set(row_bits)]
 
@@ -257,14 +271,24 @@ def main():
     out = dict(routes=routes.reshape(a.layers, Fn, C, T, -1), chunks=np.array(chunks), fmts=np.array(fmts),
                ids=ids.numpy(), timing=np.array(timing))
     if full:
-        W = tensor(src, "lm_head.weight")
-        W8 = torch.cat([bfp(W[i:i + 16384], 7) for i in range(0, W.shape[0], 16384)])   # chunks: bounded temporaries
-        Wf = [W if FORMATS[f][0] is None else W8 for f in fmts]         # LM head bfp8 wherever dense is quantized
+        # LM heads kept in bf16: BFP values (<= 7 significant bits, fp32 exponent range) are exact in bf16
+        W, VC = tensor(src, "lm_head.weight", None), 32768
+        V = W.shape[0]
+        heads = {None: W}
+        for f in fmts:
+            mb = None if FORMATS[f][0] is None else MB[plan.fmt_of(FORMATS[f][0], "lm_head")]
+            if mb not in heads:
+                heads[mb] = torch.cat([bfp(W[i:i + 16384].float(), mb).bfloat16() for i in range(0, V, 16384)])
+        Wf = [heads[None if FORMATS[f][0] is None else MB[plan.fmt_of(FORMATS[f][0], "lm_head")]] for f in fmts]
         metrics = np.zeros((Fn, C, 3))                                   # nll, kld, top-1 agreement (sums)
         for c in range(C):
             for t0 in range(0, T - 1, 128):
                 t1 = min(t0 + 128, T - 1)
-                lp = torch.log_softmax(torch.stack([h[f * C + c, t0:t1] @ Wf[f].T for f in range(Fn)]), dim=-1)
+                lg = torch.empty(Fn, t1 - t0, V)
+                for f in range(Fn):
+                    for i in range(0, V, VC):                            # fp32 slices: bounded temporaries
+                        lg[f, :, i:i + VC] = h[f * C + c, t0:t1] @ Wf[f][i:i + VC].float().T
+                lp = torch.log_softmax(lg, dim=-1)
                 tgt = ids[c, t0 + 1:t1 + 1]
                 for f in range(Fn):
                     metrics[f, c, 0] -= lp[f, torch.arange(t1 - t0), tgt].sum().item()
@@ -343,12 +367,16 @@ def analyze(prof=None):
            f"Wall time {float(z['wall_s']) / 60:.0f} min on a GitHub runner.\n"]
     if "metrics" in z:
         m = z["metrics"]
-        out += ["### Accuracy of BFP experts (dense weights unquantized)\n",
-                "KLD and top-1 agreement are against the bf16 run on the same tokens.\n",
-                "| Text | Experts | PPL | KLD mean | Same top-1 |", "|---|---|---:|---:|---:|"]
+        out += ["### Accuracy per format\n",
+                "bf16 = checkpoint weights. tuff = every dense projection and the LM head in BFP8, routed experts in "
+                "BFP4. A group name (plan.DENSE) = tuff with that dense group in BFP4. KLD and top-1 agreement are "
+                "against bf16 on the same tokens.\n",
+                "| Text | Format | Dense on card | PPL | KLD mean | Same top-1 |", "|---|---|---:|---:|---:|---:|"]
         for c, name in enumerate(chunks):
             for f, fm in enumerate(fmts):
-                out.append(f"| {name} | {fm} | {np.exp(m[f, c, 0]):.3f} | "
+                spec = FORMATS.get(fm, (None,))[0]
+                gb = "bf16" if spec is None else f"{plan.dense_bytes(spec) / 1e9:.2f} GB"
+                out.append(f"| {name} | {fm} | {gb} | {np.exp(m[f, c, 0]):.3f} | "
                            f"{'–' if f == 0 else f'{m[f, c, 1]:.4f}'} | {'–' if f == 0 else f'{100 * m[f, c, 2]:.2f}%'} |")
     out += ["\n### Routing\n",
             "Hit rate = share of the 10 routed experts per token and layer that a placement keeps on the card. Card capacity "
@@ -405,29 +433,25 @@ def analyze(prof=None):
         ms = np.array(list(win))
         # Basalt community medians (docs/community/benchmarks.json, 20 runs): draft length, acceptance per draft
         scen = {"prose": (1.8, 0.6675), "chat": (2.35, 0.7285), "structured": (6.9, 0.9835)}
-        out += ["\nPredicted decode with MTP (E5-2690 v4, 64 GB), assuming Basalt's measured draft lengths and acceptance; "
-                "the experts per step are interpolated from the table above.\n",
-                "| Text kind | drafts / step | tokens / step | dense BFP8 | dense BFP4 |", "|---|---:|---:|---:|---:|"]
-        for kind, (dl, acc) in scen.items():
-            m = 1 + dl
-            hot, cold = (np.interp(m, ms, [win[x][i] for x in ms]) for i in (1, 2))
-            r = [plan.decode_mtp(host, hot, cold, m, 1 + dl * acc, d) for d in ("bfp8", "bfp4")]
-            out.append(f"| {kind} | {dl} | {1 + dl * acc:.2f} | {r[0]:.1f} t/s | {r[1]:.1f} t/s |")
         # everything together: adaptive cache (25 copies per token) + MTP, on the topic-change sequence
         mix = seqs[" then ".join(chunks)] if C > 1 else seqs[chunks[0]]
+
+        def cap(d):
+            return plan.memory_map(d, "bfp4", 32768, host)["n_dev"] * L // plan.QFN["L"]
+        dense_rows = {"bfp8": "bfp8", **{fm: FORMATS[fm][0] for fm in fmts if fm.startswith("tuff-") and fm in FORMATS}}
         out += ["\n### Predicted decode: adaptive cache + MTP\n",
-                f"Adaptive cache with up to 25 copies per token, hit rate measured on '{' then '.join(chunks)}'; MTP "
-                "as above, with each step's union of experts split by that hit rate. Batch 1, 4k context.\n",
+                f"Adaptive cache with up to 25 copies per token, hit rate measured on '{' then '.join(chunks)}'. MTP "
+                "assumes Basalt's measured draft lengths and acceptance (community medians), with each step's experts "
+                "interpolated from the table above and split by that hit rate. Batch 1, 4k context.\n",
                 "| Host | Dense on card | Hit rate | no MTP | prose | chat | structured |", "|---|---|---:|---:|---:|---:|---:|"]
         for hn in ("E5-2690v4, 4x16GB", "8259CL, 6x32GB"):
             hh = plan.HOSTS[hn]
-            for d in ("bfp8", "bfp4"):
-                hr, cp = simulate_cache(mix, caps[d], 25, b, L * E)
-                cells = [f"{plan.decode(hh, hr, d, promote=cp)[0]:.1f}"]
+            for d, spec in dense_rows.items():
+                hr, cp = simulate_cache(mix, cap(spec), 25, b, L * E)
+                cells = [f"{plan.decode(hh, hr, spec, promote=cp)[0]:.1f}"]
                 for kind, (dl, acc) in scen.items():
-                    m = 1 + dl
-                    u = np.interp(m, ms, [win[x][0] for x in ms])
-                    cells.append(f"{plan.decode_mtp(hh, u * hr, u * (1 - hr), m, 1 + dl * acc, d, promote=cp * (1 + dl * acc)):.1f}")
+                    u = np.interp(1 + dl, ms, [win[x][0] for x in ms])
+                    cells.append(f"{plan.decode_mtp(hh, u * hr, u * (1 - hr), 1 + dl, 1 + dl * acc, spec, promote=cp * (1 + dl * acc)):.1f}")
                 out.append(f"| {hn} | {d} | {hr:.1%} | " + " | ".join(cells) + " |")
     if prof and "metrics" in z:
         key = ("Basalt's shipped profile", chunks[0])
@@ -436,6 +460,31 @@ def analyze(prof=None):
                 "batch 1, no MTP).\n", "| Dense on card | Hit rate | t/s |", "|---|---:|---:|"]
         for (d, n), h in zip(caps.items(), hits[key]):
             out.append(f"| {d} | {h:.1%} | {plan.decode(host, h, d)[0]:.1f} |")
+    if prof and "metrics" in z and "tuff" in fmts:
+        # one group at a time in BFP4 on top of tuff; greedy order = least KLD per GB of card memory saved
+        km, tm1, base = z["metrics"][:, :, 1].mean(1), z["metrics"][:, :, 2].mean(1), fmts.index("tuff")
+        p8, pp = plan.dense_bytes("bfp8"), plan.params()
+        groups = [(next(iter(FORMATS[fm][0])), f) for f, fm in enumerate(fmts) if fm in FORMATS and FORMATS[fm][0]
+                  and len(FORMATS[fm][0]) == 1]
+        saved = {g: (p8 - plan.dense_bytes({g: "bfp4"})) / 1e9 for g, _ in groups}
+        groups.sort(key=lambda gf: (km[gf[1]] - km[base]) / saved[gf[0]])
+
+        def tps(spec):
+            hr, cp = simulate_cache(mix, cap(spec), 25, b, L * E)
+            return plan.decode(host, hr, spec, promote=cp)[0]
+        out += ["\n### Which dense groups tolerate BFP4\n",
+                "Each row is tuff with one dense group in BFP4 instead of BFP8; ΔKLD and Δtop-1 are against tuff, "
+                "mean of the texts. Rows are sorted by ΔKLD per GB of card memory saved. 'Cumulative' moves the groups "
+                "to BFP4 from the top down and assumes their errors add (a run of the chosen mix checks that); t/s from "
+                "plan.py with the adaptive cache (E5-2690 v4, 25 copies per token, no MTP).\n",
+                "| Group | Params | Card GB saved | ΔKLD | Δ top-1 | Cumulative ΔKLD | Cumulative t/s |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+                f"| (tuff: all BFP8) | | | | | 0 | {tps('bfp8'):.1f} |"]
+        spec, cum = {}, 0.0
+        for g, f in groups:
+            spec[g], cum = "bfp4", cum + km[f] - km[base]
+            out.append(f"| {g} | {pp[g] / 1e6:.0f}M | {saved[g]:.2f} | {km[f] - km[base]:+.4f} | "
+                       f"{100 * (tm1[f] - tm1[base]):+.2f} pt | {cum:.4f} | {tps(dict(spec)):.1f} |")
     text = "\n".join(out) + "\n"
     (ROOT / "results" / "trace.md").write_text(text, encoding="utf-8")
     print(text)

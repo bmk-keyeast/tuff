@@ -44,7 +44,23 @@ def params(m=QFN):
     return dict(attn=n_full * full + n_lin * lin, attn_full=full, shared=L * 3 * d * m["S"], router=L * d * m["E"], hc=L * hc,
                 lm_head=m["V"] * d, embed=m["V"] * d, ngram=m["ngram_rows"] * d,
                 expert=expert, n_experts=L * m["E"], mtp_experts=m["E"] * expert,
-                n_full=n_full, n_lin=n_lin)
+                n_full=n_full, n_lin=n_lin,
+                # dense groups that can take different formats (trace.py measures each one's accuracy)
+                lin_qkv=n_lin * d * (2 * kd + vd), lin_z=n_lin * d * vd, lin_out=n_lin * vd * d,
+                lin_misc=n_lin * (d * 2 * m["lin_v_heads"] + (2 * kd + vd) * m["conv"]), full=n_full * full)
+
+
+DENSE = ("lin_qkv", "lin_z", "lin_out", "lin_misc", "full", "shared", "router", "hc", "lm_head")
+
+
+def fmt_of(dense_fmt, group):
+    """dense_fmt: one format for every dense group, or {group: format} overrides on top of bfp8."""
+    return dense_fmt.get(group, "bfp8") if isinstance(dense_fmt, dict) else dense_fmt
+
+
+def dense_bytes(dense_fmt="bfp8"):
+    p = params()
+    return sum(p[g] * B[fmt_of(dense_fmt, g)] for g in DENSE)
 
 
 DEVICE = dict(mem=32 * GiB, reserve=2 * GiB, bw=512 * GB,
@@ -66,7 +82,7 @@ NGRAM_BYTES_PER_PARAM = 28.8e9 / 51.2e9   # Strata's quantized N-gram shard: 28.
 
 def memory_map(dense_fmt="bfp8", expert_fmt="bfp4", ctx=32768, host=None):
     p, m = params(), QFN
-    dense = (p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"]) * B[dense_fmt]
+    dense = dense_bytes(dense_fmt)
     kv = 2 * p["n_full"] * m["KV"] * m["hd"] * B["bfp8"] * ctx
     state = p["n_lin"] * m["lin_v_heads"] * m["lin_hd"] * m["lin_hd"] * 4   # fp32 recurrent state
     eb = p["expert"] * B[expert_fmt]
@@ -107,7 +123,8 @@ def decode_mtp(host, hot, cold, m, accepted, dense_fmt="bfp8", expert_fmt="bfp4"
     trace.py). accepted: tokens emitted per step (1 + accepted drafts)."""
     p, q = params(), QFN
     mm = memory_map(dense_fmt, expert_fmt, ctx, host)
-    dev_bw, cpu_bw, b = DEVICE["bw"] * DEVICE["eff"], host["bw"] * CPU_EFF, B[dense_fmt]
+    dev_bw, cpu_bw = DEVICE["bw"] * DEVICE["eff"], host["bw"] * CPU_EFF
+    b = {g: B[fmt_of(dense_fmt, g)] for g in DENSE}
     # ponytail: card compute ignored; m <= 8 tokens stays bandwidth-bound on 120 Tensix cores
     t_dense = (mm["dense"] + mm["kv"] * m + mm["state"]) / dev_bw
     t_hot = q["L"] * hot * mm["eb"] / dev_bw
@@ -115,8 +132,8 @@ def decode_mtp(host, hot, cold, m, accepted, dense_fmt="bfp8", expert_fmt="bfp4"
     t_pcie = q["L"] * (PCIE_RT_US * 1e-6 + 2 * m * q["d"] * 2 / (PCIE * PCIE_EFF))
     # one draft token: the MTP layer (full attention, shared expert, router, hyper-connections, two d x d input
     # projections, draft head over the reduced vocabulary) on the card, its 10 routed experts on the CPU
-    mtp_dense = (p["attn_full"] + 3 * q["d"] * q["S"] + q["d"] * q["E"] + p["hc"] / q["L"] + 2 * q["d"] ** 2
-                 + DRAFT_VOCAB * q["d"]) * b
+    mtp_dense = (p["attn_full"] * b["full"] + 3 * q["d"] * q["S"] * b["shared"] + q["d"] * q["E"] * b["router"]
+                 + p["hc"] / q["L"] * b["hc"] + (2 * q["d"] ** 2 + DRAFT_VOCAB * q["d"]) * b["lm_head"])
     t_draft = mtp_dense / dev_bw + q["k"] * mm["eb"] / cpu_bw + PCIE_RT_US * 1e-6
     t = t_dense + max(t_hot, t_cold + t_pcie) + (m - 1) * t_draft
     return accepted / max(t, t_pcie + promote * mm["eb"] / (PCIE * PCIE_EFF))
@@ -164,6 +181,8 @@ def _check():
     active = (p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"] + p["embed"]
               + QFN["L"] * QFN["k"] * p["expert"])
     assert 5.5e9 < active < 7.5e9, active   # published "~6B"; ours also counts embedding + LM head (1.3B)
+    assert sum(p[g] for g in DENSE) == p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"]
+    assert dense_bytes({g: "bfp4" for g in DENSE}) == dense_bytes("bfp4")
     assert abs(p["ngram"] / 1e9 - 51.2) < 0.1               # published: ~51B N-gram embeddings
     mm = memory_map(host=HOSTS["E5-2690v4, 4x16GB"])
     assert mm["fits"] and 0 < mm["f"] < 1
