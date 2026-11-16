@@ -16,8 +16,10 @@ this one model, and it is shaped by two facts about the hardware:
 - the host's PCIe 3.0 link is 4 to 9 times slower than its own DRAM, so **cold experts are computed on the CPU where they
   live**, and only hidden-state vectors cross the bus;
 - the card computes natively in block-float formats, so **experts are stored in Tenstorrent's `bfp4_b`/`bfp8_b` on both
-  sides**. Moving an expert between host RAM and the card is a byte permutation plus a table recode of each mantissa
-  (sign-magnitude on the card, offset binary on the host), never a re-quantization.
+  sides**. The host packer rounds exactly like tt-metal (ties to even, its exponent rule), so moving an expert from host
+  RAM to the card is a byte permutation plus a table recode of each mantissa (offset binary on the host, sign-magnitude
+  on the card), never a re-quantization: [`kernels/tt_tile.c`](kernels/tt_tile.c) produces tt-metal's tiles byte for
+  byte.
 
 Sibling project: [blackhole-llm](https://github.com/bmk-keyeast/blackhole-llm) (BFP accuracy study across 6 models).
 Part of the KEYEAST club's Tenstorrent work at Changwon Science High School.
@@ -188,6 +190,8 @@ group of 4 tokens; on CI, 4 tokens take 1.94× the time of 1.
 | [`kernels/store.c`](kernels/store.c) | `tstore`: memory-maps the converted layer files; gate, up and down of any expert are zero-copy `bfp_mat` views |
 | [`kernels/bfp_cuda.cu`](kernels/bfp_cuda.cu) | GEMV (1–4 tokens) and MoE layer on an NVIDIA GPU, same byte layout as the host; compiled in CI, not run yet |
 | [`tp_check.py`](tp_check.py) | The card/GPU tensor-parallel split is exact, on transformers' Qwen4Exp layer code |
+| [`ref.py`](ref.py) | QFN decode as a per-token recurrence in plain numpy, keyed by checkpoint names: DeltaNet conv window and state, KV cache with the QSA indexer, PLE n-gram hashing and dilated conv, hyper-connections, MoE. The spec for the device path; CI checks it against transformers' prefill on a tiny random model |
+| [`kernels/tt_tile.c`](kernels/tt_tile.c) | Host panels → Tenstorrent `bfp4_b`/`bfp8_b` tiles of W^T (8×8 nibble transposes + byte table, 1.1 GB/s per core); CI compares it with a port of tt-metal's `pack_as_bfp_tiles` |
 | [`bench/host.sh`](bench/host.sh) | Measures the real host: DRAM read bandwidth, cold experts per thread count, MTP, the GPU → `results/host_*.md` |
 | [`kernels/test_bfp.c`](kernels/test_bfp.c) | Exact round-trip, SIMD = scalar = fp64 math, SQNR bounds at QFN expert shapes, fused layer = sum of experts, multi-token = per-token, Python packer = C packer (ASan/UBSan) |
 | [`kernels/bench_bfp.c`](kernels/bench_bfp.c) | Cold-expert throughput at QFN shapes from a DRAM pool larger than the caches, 1–8 tokens |
@@ -236,6 +240,8 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Per-group precision for the dense part: LM head and DeltaNet z in BFP4, full attention must stay BFP8
 - [x] Adaptive cache policy in engine code (`tcache`), replay-tested; memory-mapped expert store (`tstore`)
 - [x] RTX 4060 Ti: decode model, exact tensor-parallel split (checked), CUDA kernels on the host layout (compiled)
+- [x] Host packing identical to tt-metal's; host → card tile conversion checked against tt-metal's packer
+- [x] Decode recurrence specified in numpy (`ref.py`) and checked against transformers
 - [ ] Copy engine: background PCIe copies of promoted experts to the card and the GPU (pinned host memory)
 - [ ] Run `test_cuda` and `bench/host.sh` on the real box; replace GPU_EFF, CPU_EFF and the round-trip guesses
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
@@ -279,6 +285,9 @@ reporting set to "OS First" in the BIOS.
   예측 56 t/s (카드만 41), MTP 사용 시 87~180 t/s. 나누는 방식이 수학적으로 정확한지는 HF 코드로 검증(`tp_check.py`).
   4060 Ti용 CUDA 커널도 작성(CI 컴파일 통과, 실제 GPU에서는 아직 미실행)
 - 실제 호스트가 준비되면 돌릴 측정 스크립트(`bench/host.sh`)
+- 호스트 BFP 반올림을 tt-metal과 똑같이 맞춤(동률은 짝수 쪽). 이전에는 동률에서 달라 카드로 옮길 때 값이 미세하게 바뀔 수 있었음.
+  호스트 형식 → 카드 타일 변환기(`tt_tile.c`)가 tt-metal 패커와 바이트 단위로 동일함을 확인
+- 디코딩 한 스텝을 numpy로 그대로 적은 기준 구현(`ref.py`): 카드 경로를 구현할 때의 명세. HF와 결과가 같은지 CI에서 확인
 
 **다음 할 일:** 카드가 오면 TT-NN 카드 경로와 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 

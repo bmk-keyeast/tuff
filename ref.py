@@ -15,6 +15,10 @@ recurrence out with nothing hidden in a framework, in float64, keyed by the chec
 
 Ref.step(token) returns the hidden state after the final hyper-connection mixer (QFN has no final norm; the LM head
 multiplies it directly).
+
+One thing transformers leaves undefined: when key blocks tie at the indexer's top-k cutoff (in practice blocks whose
+ReLU'd score is exactly 0), torch.topk's order decides. Ref keeps the lowest block indices; the engine should do the
+same, which is as valid an output of the model as transformers' pick.
 """
 import math
 
