@@ -1,0 +1,27 @@
+# ref.py's decode recurrence on the real checkpoint (streamed), checked against trace.py's recorded routing.
+name: ref-real
+on:
+  workflow_dispatch:
+    inputs:
+      tokens: { description: "tokens of the recorded wikitext text", default: "32" }
+
+permissions:
+  contents: write
+
+jobs:
+  ref-real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q "transformers==5.23.0" numpy
+      - run: python -u ref_real.py --tokens "${{ inputs.tokens }}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: commit results
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add results/ref_real.md
+          git commit -m "ref-real: ref.py on the real weights, ${{ inputs.tokens }} tokens"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done; exit 1

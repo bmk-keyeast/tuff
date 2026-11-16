@@ -55,8 +55,10 @@ def i64(v):
 
 class Ref:
     def __init__(self, w, cfg):
-        """w: name -> numpy array, names as in the checkpoint after "model.language_model." (e.g. "layers.0.mlp.gate.weight")."""
-        self.w = {k: np.asarray(v, np.float64) if np.asarray(v).dtype.kind == "f" else np.asarray(v) for k, v in w.items()}
+        """w: name -> numpy array, names as in the checkpoint after "model.language_model." (e.g. "layers.0.mlp.gate.weight").
+        A dict is converted to float64 up front; any other mapping (ref_real.py's lazy checkpoint reader) is used as is."""
+        self.w = {k: np.asarray(v, np.float64) if np.asarray(v).dtype.kind == "f" else np.asarray(v) for k, v in w.items()}             if isinstance(w, dict) else w
+        self.routes = {}                                                       # (layer, position) -> routed experts
         self.c = cfg
         c = cfg
         self.d, self.hc, self.eps = c.hidden_size, c.hc_count, c.rms_norm_eps
@@ -169,6 +171,7 @@ class Ref:
         pr = np.exp(logits - logits.max())
         pr /= pr.sum()
         top = np.argsort(-pr, kind="stable")[:c.num_experts_per_tok]
+        self.routes[L, self.t] = top
         wt = pr[top] / pr[top].sum() if c.norm_topk_prob else pr[top]
         y = np.zeros(self.d)
         for e, we in zip(top, wt):
@@ -209,19 +212,45 @@ class Ref:
         taps = win[:, ::c.ngram_size]                                          # dilation = ngram_size: t-9, t-6, t-3, t
         return gv + silu((self.w[p + ".conv1d.weight"][:, 0, :] * taps).sum(1))
 
+    def attn_block(self, L, h4):
+        if L in self.ple:
+            h4 = h4 + self.ple_layer(L, h4)
+        x, inj = self.gated_residual(f"layers.{L}.attn_hyper_connection", h4)
+        o = self.deltanet(L, x) if self.c.layer_types[L] == "linear_attention" else self.attention(L, x)
+        return h4 + (inj[:, None] * o[None, :]).ravel()
+
+    def mlp_block(self, L, h4):
+        x, inj = self.gated_residual(f"layers.{L}.mlp_hyper_connection", h4)
+        return h4 + (inj[:, None] * self.moe(L, x)[None, :]).ravel()
+
     def step(self, token):
+        """One decode step: the token through every layer, as the engine runs it."""
         self.tokens.append(int(token))
         h4 = np.tile(self.w["embed_tokens.weight"][token], self.hc)
-        for L, kind in enumerate(self.c.layer_types[:self.c.num_hidden_layers]):
-            if L in self.ple:
-                h4 = h4 + self.ple_layer(L, h4)
-            x, inj = self.gated_residual(f"layers.{L}.attn_hyper_connection", h4)
-            o = self.deltanet(L, x) if kind == "linear_attention" else self.attention(L, x)
-            h4 = h4 + (inj[:, None] * o[None, :]).ravel()
-            x, inj = self.gated_residual(f"layers.{L}.mlp_hyper_connection", h4)
-            h4 = h4 + (inj[:, None] * self.moe(L, x)[None, :]).ravel()
+        for L in range(self.c.num_hidden_layers):
+            h4 = self.mlp_block(L, self.attn_block(L, h4))
         self.t += 1
         return self.gated_residual("hyper_connection_mixer", h4, combine=False)
+
+    def run(self, tokens, before_mlp=None, after_layer=None):
+        """The same recurrence for a whole sequence, layer by layer (each layer's weights are needed once), with the
+        same per-layer state: identical results to step() on every token. before_mlp(L, xs) sees every token's MoE
+        input before the experts run (to prefetch them); after_layer(L) can drop that layer's weights."""
+        tokens = [int(t) for t in tokens]
+        H = [np.tile(self.w["embed_tokens.weight"][t], self.hc) for t in tokens]
+        for L in range(self.c.num_hidden_layers):
+            for t in range(len(tokens)):
+                self.t, self.tokens = t, tokens[:t + 1]
+                H[t] = self.attn_block(L, H[t])
+            if before_mlp:
+                before_mlp(L, [self.gated_residual(f"layers.{L}.mlp_hyper_connection", h)[0] for h in H])
+            for t in range(len(tokens)):
+                self.t = t
+                H[t] = self.mlp_block(L, H[t])
+            if after_layer:
+                after_layer(L)
+        self.t, self.tokens = len(tokens), tokens
+        return [self.gated_residual("hyper_connection_mixer", h, combine=False) for h in H]
 
 
 def tiny_config():
@@ -263,6 +292,10 @@ def check(T=40, seed=0):
     ref = Ref({k: v.numpy() for k, v in model.state_dict().items()}, cfg)
     ref.tie_break = lambda L, t: sorted({i // ratio for i in np.flatnonzero(masks[L][t][:(t + 1) // ratio * ratio])})
     got = np.stack([ref.step(int(t)) for t in ids[0]])
+    ref2 = Ref({k: v.numpy() for k, v in model.state_dict().items()}, cfg)
+    ref2.tie_break = ref.tie_break
+    assert np.allclose(np.stack(ref2.run(ids[0])), got, rtol=0, atol=1e-12), "run() != step()"
+    assert all((ref2.routes[k] == v).all() for k, v in ref.routes.items()), "run() routes != step() routes"
     err = np.abs(got - want).max(1) / np.abs(want).max(1)
     print(f"ref.py decode == transformers prefill: {T} tokens, {cfg.num_hidden_layers} layers "
           f"({cfg.layer_types.count('linear_attention')} DeltaNet, PLE before layer {cfg.ple_layer_ids[0] - 1}; "
