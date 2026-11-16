@@ -92,7 +92,10 @@ def memory_map(dense_fmt="bfp8", expert_fmt="bfp4", ctx=32768, host=None):
     host_need = (p["n_experts"] - n_dev) * eb + p["embed"] * B["bf16"] + p["mtp_experts"] * B[expert_fmt]
     ngram = p["ngram"] * NGRAM_BYTES_PER_PARAM
     free = host["ram"] - HOST_RESERVE - host_need if host else 0
+    # the adaptive cache can promote any expert, so the host keeps all of them (68 GB at BFP4), not only the cold ones
+    all_need = p["n_experts"] * eb + p["embed"] * B["bf16"] + p["mtp_experts"] * B[expert_fmt]
     return dict(dense=dense, kv=kv, state=state, eb=eb, n_dev=n_dev, f=n_dev / p["n_experts"], host_need=host_need,
+                all_in_ram=all_need <= (host["ram"] - HOST_RESERVE) if host else None,
                 ngram=ngram, fits=host_need <= (host["ram"] - HOST_RESERVE) if host else None,
                 ngram_in_ram=free >= ngram if host else None)
 
@@ -199,13 +202,14 @@ def report():
            f"(published: ~6B; ours includes embedding and LM head), N-gram embeddings {p['ngram'] / 1e9:.1f}B (published: ~51B), "
            f"routed experts {p['n_experts']:,} x {p['expert'] / 1e6:.2f}M params.\n",
            "### Memory map (32k context)\n",
-           "| Host | Dense on card | Routed experts on card | Cold experts + embeddings + MTP experts in host RAM | Fits | N-gram table (28.8 GB) |",
-           "|---|---|---:|---:|:-:|---|"]
+           "| Host | Dense on card | Routed experts on card | Cold experts + embeddings + MTP experts in host RAM | Fits | All experts in RAM (adaptive cache) | N-gram table (28.8 GB) |",
+           "|---|---|---:|---:|:-:|:-:|---|"]
     for hn, h in HOSTS.items():
         for df in ["bfp8", "bfp4"]:
             mm = memory_map(df, "bfp4", 32768, h)
             out.append(f"| {hn} | {df}, {mm['dense'] / GB:.1f} GB | {mm['n_dev']:,} / {p['n_experts']:,} ({mm['f']:.0%}) | "
                        f"{mm['host_need'] / GB:.1f} GB | {'yes' if mm['fits'] else 'no'} | "
+                       f"{'yes' if mm['all_in_ram'] else 'no: rarely used experts on NVMe'} | "
                        f"{'host RAM' if mm['ngram_in_ram'] else 'NVMe (mmap)'} |")
     out += ["\n### Decode speed, batch 1, 4k context, experts BFP4\n",
             f"Efficiencies: card {DEVICE['eff']:.0%} of 512 GB/s, DRAM {CPU_EFF:.0%} of peak, PCIe {PCIE_EFF:.0%}, "

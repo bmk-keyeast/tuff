@@ -5,3 +5,4 @@ kernels/selftest.bin
 kernels/test_cache
 cache.bin
 basalt.prof
+kernels/test_store

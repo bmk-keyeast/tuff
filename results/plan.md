@@ -4,14 +4,14 @@ Parameters (this count): main model 125.7B (published: ~125B), active per token 
 
 ### Memory map (32k context)
 
-| Host | Dense on card | Routed experts on card | Cold experts + embeddings + MTP experts in host RAM | Fits | N-gram table (28.8 GB) |
-|---|---|---:|---:|:-:|---|
-| E5-2690v4, 4x16GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | NVMe (mmap) |
-| E5-2690v4, 4x16GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | NVMe (mmap) |
-| E5-2690v4, 128GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | host RAM |
-| E5-2690v4, 128GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | host RAM |
-| 8259CL, 6x32GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | host RAM |
-| 8259CL, 6x32GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | host RAM |
+| Host | Dense on card | Routed experts on card | Cold experts + embeddings + MTP experts in host RAM | Fits | All experts in RAM (adaptive cache) | N-gram table (28.8 GB) |
+|---|---|---:|---:|:-:|:-:|---|
+| E5-2690v4, 4x16GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | no: rarely used experts on NVMe | NVMe (mmap) |
+| E5-2690v4, 4x16GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | no: rarely used experts on NVMe | NVMe (mmap) |
+| E5-2690v4, 128GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | yes | host RAM |
+| E5-2690v4, 128GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | yes | host RAM |
+| 8259CL, 6x32GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | yes | host RAM |
+| 8259CL, 6x32GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | yes | host RAM |
 
 ### Decode speed, batch 1, 4k context, experts BFP4
 

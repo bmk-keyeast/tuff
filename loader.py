@@ -3,6 +3,7 @@
     python loader.py convert SRC OUT [--fmt bfp4] [--layers 0-47]  # SRC: local snapshot dir, or "hf" (HTTP)
     python loader.py accuracy [--layers 0,9,19,28,38,47] [--experts 8]  # real-weight accuracy -> results/
     python loader.py selftest FILE                                 # packed random matrices for kernels/test_bfp
+    python loader.py fake DIR N [--fmt bfp4]                       # N random experts as layer 0, for kernels/test_store
 
 Packing (rounding and byte layout) is bit-identical to bfp_pack in kernels/bfp.c; CI checks this with selftest.
 
@@ -140,14 +141,14 @@ def pack(w, fmt):
     return exp.tobytes(), dw.astype("<u4").tobytes()
 
 
-def convert(src, out, fmt, layers):
+def convert(src, out, fmt, layers, n_experts=E):
     out.mkdir(parents=True, exist_ok=True)
     sizes = None
     for L in layers:
         t0 = time.time()
         path = out / f"experts.{L:02d}.{fmt}"
         with open(path.with_suffix(".part"), "wb") as fh:
-            for e in range(E):
+            for e in range(n_experts):
                 parts = [p for name in ("gate_up_proj", "down_proj") for p in pack(src.expert(EXPERT.format(L, name), e), fmt)]
                 sizes = sizes or [len(p) for p in parts]
                 for p in parts:
@@ -155,7 +156,7 @@ def convert(src, out, fmt, layers):
         path.with_suffix(".part").replace(path)
         print(f"layer {L}: {path.stat().st_size / 1e9:.2f} GB in {time.time() - t0:.0f} s", flush=True)
     (out / "manifest.json").write_text(json.dumps(dict(
-        model="Qwen/Qwen3.8-Flash-Next", fmt=fmt, layers=list(layers), experts=E,
+        model="Qwen/Qwen3.8-Flash-Next", fmt=fmt, layers=list(layers), experts=n_experts,
         matrices=[dict(name="gate_up", out=2 * I, inn=D), dict(name="down", out=D, inn=I)],
         piece_bytes=sizes, expert_bytes=sum(sizes), layout="kernels/bfp.h"), indent=1))
 
@@ -226,6 +227,24 @@ def selftest(path):
             fh.write(struct.pack("<iii", MBITS[fmt], out, n) + w.tobytes() + ex + mt)
 
 
+class FakeSource:
+    """Random experts with QFN's shapes, for kernels/test_store.c: `fake` converts them like a real layer and also
+    writes their float weights (weights.f32: per expert gate_up [1280][2560], then down [2560][640])."""
+    def expert(self, name, e):
+        rng = np.random.default_rng([e, name.endswith("down_proj")])
+        shape = (D, I) if name.endswith("down_proj") else (2 * I, D)
+        return (0.02 * rng.standard_normal(shape)).astype(np.float32)
+
+
+def fake(out, fmt, n):
+    src = FakeSource()
+    convert(src, out, fmt, [0], n)
+    with open(out / "weights.f32", "wb") as fh:
+        for e in range(n):
+            for name in ("gate_up_proj", "down_proj"):
+                fh.write(src.expert(EXPERT.format(0, name), e).tobytes())
+
+
 def layer_list(s):
     return [int(x) for part in s.split(",") for x in
             (range(int(part.split("-")[0]), int(part.split("-")[1]) + 1) if "-" in part else [part])]
@@ -233,7 +252,7 @@ def layer_list(s):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["convert", "accuracy", "selftest"])
+    ap.add_argument("cmd", choices=["convert", "accuracy", "selftest", "fake"])
     ap.add_argument("args", nargs="*")
     ap.add_argument("--fmt", default="bfp4", choices=list(MBITS))
     ap.add_argument("--layers", default=None)
@@ -241,6 +260,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.cmd == "selftest":
         selftest(a.args[0])
+    elif a.cmd == "fake":                                          # fake DIR N: N random experts as layer 0
+        fake(Path(a.args[0]), a.fmt, int(a.args[1]))
     elif a.cmd == "convert":
         convert(Source(a.args[0]), Path(a.args[1]), a.fmt, layer_list(a.layers or "0-47"))
     else:

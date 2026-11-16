@@ -18,6 +18,8 @@ jobs:
           curl -sfLo basalt.prof https://raw.githubusercontent.com/jesdga95/basalt/main/data/profiles/qwen4exp-48x512.prof
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu   # trace.py imports it
           python trace.py cache-check basalt.prof cache.bin && ./kernels/test_cache cache.bin
+      - name: tstore maps loader.py's layer files as bfp_pack would pack them
+        run: for f in bfp4 bfp8; do python loader.py fake /tmp/store_$f 3 --fmt $f && ./kernels/test_store /tmp/store_$f $f; done
       - run: make -C kernels bench_bfp
       - name: build phase-0 kernel (baseline)
         run: |
