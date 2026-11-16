@@ -18,12 +18,14 @@ enum { TSTORE_MAX_LAYERS = 64, TSTORE_D = 2560, TSTORE_I = 640 };
 typedef struct {
     enum bfp_fmt fmt;
     int layers, experts;                      /* experts per layer (512 for QFN; fewer in tests) */
+    int mtp;                                  /* layer index of the MTP drafter's experts (= layers), or -1 */
     size_t piece[4], expert_bytes;            /* gate_up exp, gate_up mant, down exp, down mant */
     uint8_t *base[TSTORE_MAX_LAYERS];
     size_t len[TSTORE_MAX_LAYERS];
 } tstore;
 
-/* opens DIR/experts.00.FMT .. experts.(layers-1).FMT; 0 on success, -1 (and a message on stderr) otherwise */
+/* opens DIR/experts.00.FMT .. experts.(layers-1).FMT, and experts.mtp.FMT if present (as layer s->mtp);
+ * 0 on success, -1 (and a message on stderr) otherwise */
 int tstore_open(tstore *s, const char *dir, enum bfp_fmt fmt, int layers, int lock);
 void tstore_close(tstore *s);
 /* views of expert e of layer L: gate [640][2560], up [640][2560], down [2560][640] */

@@ -20,6 +20,7 @@ int main(int argc, char **argv) {
     enum bfp_fmt fmt = strcmp(argv[2], "bfp8") ? BFP4 : BFP8;
     tstore s;
     assert(tstore_open(&s, argv[1], fmt, 1, 0) == 0);
+    assert(s.layers == 1 && s.mtp == -1);
     const int D = TSTORE_D, I = TSTORE_I;
     char path[4096];
     snprintf(path, sizeof path, "%s/weights.f32", argv[1]);
