@@ -13,7 +13,8 @@
  *               b = 8, c = 4 (bfp8) or b = 4, c = 8 (bfp4). Dword order: [p][j/c][r/8][r%8], so one 256-bit
  *               load is 8 rows x c columns. Field n = value + 2^(b-1) (offset binary, 1 .. 2^b - 1).
  *   value       (n - 2^(b-1)) * 2^(exp - 127 - (mbits - 1)),  mbits = 7 (bfp8) or 3 (bfp4)
- * Rounding when packing is round-to-nearest with saturation, as in blackhole-llm/bfp.py.
+ * Packing is tt-metal's own (convert_u32_to_bfp): shared exponent = largest exponent field of the block, mantissas
+ * rounded ties-to-even with saturation, so the card's copy of an expert is a pure re-layout of this one (tt_tile.c).
  */
 #ifndef TUFF_BFP_H
 #define TUFF_BFP_H
@@ -49,4 +50,8 @@ void moe_forward(const bfp_mat *const *w1, const bfp_mat *const *w3, const bfp_m
  * once per 4 tokens. tmp: k * min(n,4) * (2*I + d) floats */
 void moe_forward_n(const bfp_mat *const *w1, const bfp_mat *const *w3, const bfp_mat *const *w2,
                    const float *gate, int k, int n, const float *x, float *y, float *tmp);
+
+/* Tenstorrent bfp8_b/bfp4_b tiles of W^T [in][out] (out, in % 32 == 0), what the p150a stores (tt_tile.c) */
+size_t bfp_tt_bytes(enum bfp_fmt fmt, int out, int in);
+int bfp_to_tt_tiles(const bfp_mat *m, uint8_t *dst);              /* 0, or -1 if the shape is not whole tiles */
 #endif

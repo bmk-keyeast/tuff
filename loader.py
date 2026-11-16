@@ -109,19 +109,58 @@ class Source:
         return (self.expert_bf16(name, e).astype(np.uint32) << 16).view(np.float32)
 
 
+def tt_mag(u, shared, mb):
+    """|value| in mb bits for float32 bits u in blocks with shared exponent field `shared` (broadcastable): tt-metal's
+    convert_u32_to_bfp (_b formats): hidden-bit mantissa >> exponent difference, round to mb bits ties to even,
+    saturate; zero/denormal -> 0. bfp_pack in kernels/bfp.c does the same per element."""
+    e = (u >> 23) & 0xFF
+    d = shared.astype(np.int64) - e
+    mant = ((u & 0x7FFFFF) | 0x800000).astype(np.int64)
+    mant = np.where(d > 31, 0, mant >> np.minimum(d, 31))
+    sh = 24 - mb
+    rnd, mant = mant & ((1 << sh) - 1), mant >> sh
+    mant = mant + ((rnd > (1 << (sh - 1))) | ((rnd == (1 << (sh - 1))) & (mant & 1 == 1)))
+    return np.where(e == 0, 0, np.minimum(mant, (1 << mb) - 1))
+
+
 def quantize(w, fmt):
-    """float32 [out, in] -> (exp uint8 [P, in], signed q [P, 16, in], step float32 [P, in]); bfp_pack's math."""
+    """float32 [out, in] -> (exp uint8 [P, in], signed q [P, 16, in], step float32 [P, in]); bfp_pack's math, which is
+    tt-metal's: shared exponent = the largest exponent field of the 16 values, mantissas rounded ties-to-even."""
     mb = MBITS[fmt]
     out, n = w.shape
     assert out % 16 == 0 and n % 8 == 0, w.shape
-    w = np.ascontiguousarray(w, np.float32).reshape(out // 16, 16, n)
-    a = np.abs(w).max(axis=1)
-    ok = (a > 0) & np.isfinite(a)
-    e = np.clip(np.frexp(np.where(ok, a, 1))[1] - 1, mb - 126, 127)   # ilogbf, then clamp as in C
-    step = np.ldexp(np.ones_like(a), e - (mb - 1)).astype(np.float32)
-    q = np.floor(np.abs(w) / step[:, None, :] + np.float32(0.5))       # float32 arithmetic, as in C
-    q = np.where(ok[:, None, :], np.minimum(q, (1 << mb) - 1), 0).astype(np.int32)
-    return np.where(ok, e + 127, 0).astype(np.uint8), np.where(w < 0, -q, q), step
+    u = np.ascontiguousarray(w, np.float32).view(np.uint32).reshape(out // 16, 16, n)
+    shared = ((u >> 23) & 0xFF).max(axis=1)
+    q = tt_mag(u, shared[:, None, :], mb)
+    step = np.where(shared > mb - 1, np.ldexp(np.float32(1), shared.astype(np.int32) - 127 - (mb - 1)), 0).astype(np.float32)
+    return shared.astype(np.uint8), np.where(u >> 31 == 1, -q, q).astype(np.int32), step
+
+
+def tt_tiles_ref(w, fmt):
+    """tt-metal's pack_as_bfp_tiles for the device tensor W^T [in][out] (what a matmul y = x W^T reads), written from
+    its source rather than from tuff's panels: 32x32 tiles in row-major tile order; per tile 64 exponent bytes (faces
+    0..3 = top-left, top-right, bottom-left, bottom-right; 16 face rows each), then each face's mantissas row-major,
+    `32/b` per dword with element 0 in the low bits, each sign-magnitude (sign << mb | magnitude)."""
+    mb = MBITS[fmt]
+    b = mb + 1
+    t = np.ascontiguousarray(np.asarray(w, np.float32).T)
+    R, C = t.shape
+    assert R % 32 == 0 and C % 32 == 0, t.shape
+    u = t.view(np.uint32)
+    out = bytearray()
+    for ti in range(R // 32):
+        for to in range(C // 32):
+            faces = [u[32 * ti + 16 * tr:32 * ti + 16 * tr + 16, 32 * to + 16 * tc:32 * to + 16 * tc + 16]
+                     for tr in (0, 1) for tc in (0, 1)]
+            exps = [((f >> 23) & 0xFF).max(axis=1) for f in faces]                    # per face row
+            out += np.concatenate(exps).astype(np.uint8).tobytes()
+            for f, e in zip(faces, exps):
+                mag = tt_mag(f, e[:, None], mb)
+                v = (np.where((f >> 31 == 1) & (mag != 0), 1 << mb, 0) | mag).astype(np.uint32).ravel()
+                c = 32 // b
+                dw = (v.reshape(-1, c) << (b * np.arange(c, dtype=np.uint32))).sum(axis=1, dtype=np.uint32)
+                out += dw.astype("<u4").tobytes()
+    return bytes(out)
 
 
 def dequant(w, fmt):
@@ -221,10 +260,12 @@ def selftest(path):
         for fmt, out, n in [("bfp8", 32, 64), ("bfp4", 48, 40), ("bfp4", 2 * I, 64)]:
             w = (0.02 * rng.standard_normal((out, n))).astype(np.float32)
             w[:16, 3] = 0                                       # all-zero block -> exponent 0
-            w[16:32, 5] *= np.float32(1e-37)                    # subnormal block: clamped exponent
+            w[16:32, 5] *= np.float32(1e-37)                    # tiny block, partly denormal
             w[:16, 6] = [1, .125, .375, -.625, .875, -1, 0, .5, -.5, .25, -.125, .0625, -.375, 2 ** -9, .75, -.875]  # ties
+            w[16:32, 7] = 3 * w[16:32, 7] + np.float32(1e-3)     # assorted exponents within a block
             ex, mt = pack(w, fmt)
-            fh.write(struct.pack("<iii", MBITS[fmt], out, n) + w.tobytes() + ex + mt)
+            tt = tt_tiles_ref(w, fmt) if out % 32 == 0 and n % 32 == 0 else b""
+            fh.write(struct.pack("<iii", MBITS[fmt], out, n) + w.tobytes() + ex + mt + struct.pack("<i", len(tt)) + tt)
 
 
 class FakeSource:

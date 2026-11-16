@@ -61,7 +61,7 @@ def bfp(w, mb):
     ok = (a > 0) & torch.isfinite(a)
     e = (torch.frexp(torch.where(ok, a, torch.ones_like(a)))[1] - 1).clamp(mb - 126, 127)
     step = torch.ldexp(torch.ones_like(a), e - (mb - 1))[:, None]
-    q = torch.floor(x.abs() / step + 0.5).clamp_max((1 << mb) - 1) * ok[:, None]
+    q = torch.round(x.abs() / step).clamp_max((1 << mb) - 1) * ok[:, None]   # ties to even, as tt-metal
     return (torch.copysign(q, x) * step).reshape(out, n)
 
 

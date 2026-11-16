@@ -34,28 +34,37 @@ static inline uint32_t *slot(const bfp_mat *m, int p, int j, int r, int *sh) {
     return (uint32_t *)m->mant + (((size_t)p * (m->in / c) + j / c) * 2 + r / 8) * 8 + r % 8;
 }
 
+/* Magnitude of v in a block with shared (biased) exponent `shared`, exactly as tt-metal's convert_u32_to_bfp
+ * (blockfloat_common.cpp, _b formats, no truncation): the 24-bit mantissa with its hidden bit is shifted right by the
+ * exponent difference, then rounded to mb bits, ties to even, saturating. Zero and denormal inputs give 0. Packing the
+ * host copy with the card's own rounding makes host <-> card a pure byte permutation (tt_tile.c). */
+static inline int tt_mag(uint32_t u, unsigned shared, int mb) {
+    unsigned e = (u >> 23) & 0xff, sh = 24 - mb;
+    if (!e) return 0;
+    uint32_t mant = (u & 0x7fffff) | 0x800000, d = shared - e;
+    mant = d > 31 ? 0 : mant >> d;
+    uint32_t rnd = mant & ((1u << sh) - 1), tie = 1u << (sh - 1);
+    mant >>= sh;
+    if (rnd > tie || (rnd == tie && (mant & 1))) mant++;
+    return mant > (1u << mb) - 1 ? (1 << mb) - 1 : (int)mant;
+}
+
 void bfp_pack(bfp_mat *m, const float *w) {
-    const int mb = m->fmt, qmax = (1 << mb) - 1, off = qmax + 1, P = m->out / 16;
+    const int mb = m->fmt, off = 1 << mb, P = m->out / 16;
     memset(m->mant, 0, bfp_mant_bytes(m->fmt, m->out, m->in));
     for (int p = 0; p < P; p++)
         for (int j = 0; j < m->in; j++) {
-            float a = 0, step = 0;
-            for (int r = 0; r < 16; r++) a = fmaxf(a, fabsf(w[(size_t)(16 * p + r) * m->in + j]));
-            size_t b = (size_t)p * m->in + j;
-            m->exp[b] = 0;                           /* all-zero (or non-finite) block */
-            if (a != 0 && isfinite(a)) {
-                int e = ilogbf(a);                   /* floor(log2(a)) */
-                if (e < mb - 126) e = mb - 126;      /* keep the scale a normal float (tiny blocks flush) */
-                if (e > 127) e = 127;
-                m->exp[b] = (uint8_t)(e + 127);
-                step = pow2i(e - (mb - 1));
-            }
+            uint32_t u[16];
+            unsigned shared = 0;                     /* tt-metal get_max_exp: the largest exponent field */
             for (int r = 0; r < 16; r++) {
-                float v = w[(size_t)(16 * p + r) * m->in + j];
-                int q = step ? (int)floorf(fabsf(v) / step + 0.5f) : 0, sh;
-                if (q > qmax) q = qmax;
+                memcpy(&u[r], &w[(size_t)(16 * p + r) * m->in + j], 4);
+                if (((u[r] >> 23) & 0xff) > shared) shared = (u[r] >> 23) & 0xff;
+            }
+            m->exp[(size_t)p * m->in + j] = (uint8_t)shared;
+            for (int r = 0; r < 16; r++) {
+                int q = tt_mag(u[r], shared, mb), sh;
                 uint32_t *d = slot(m, p, j, r, &sh);     /* sets sh: must happen before the shift */
-                *d |= (uint32_t)(off + (v < 0 ? -q : q)) << sh;
+                *d |= (uint32_t)(off + (u[r] >> 31 ? -q : q)) << sh;
             }
         }
 }
@@ -67,7 +76,8 @@ static inline int elem(const bfp_mat *m, int p, int j, int r) {
 }
 
 static inline float scale_of(const bfp_mat *m, size_t b) {
-    return m->exp[b] ? pow2i(m->exp[b] - 127 - (m->fmt - 1)) : 0.f;
+    /* exponents <= mbits-1 (blocks below ~1e-36) decode as 0, as in the SIMD kernels */
+    return m->exp[b] > m->fmt - 1 ? pow2i(m->exp[b] - 127 - (m->fmt - 1)) : 0.f;
 }
 
 void bfp_unpack(const bfp_mat *m, float *w) {

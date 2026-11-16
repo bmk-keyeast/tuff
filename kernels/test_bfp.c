@@ -52,7 +52,7 @@ static void check(enum bfp_fmt fmt, int out, int in, double min_sqnr) {
  * exp; mant} packed by the Python loader. The C packer must produce the same bytes. */
 static int check_loader(const char *path) {
     FILE *f = fopen(path, "rb");
-    int hdr[3], n = 0;
+    int hdr[3], n = 0, n_tt = 0;
     assert(f);
     while (fread(hdr, sizeof hdr, 1, f) == 1) {
         bfp_mat m;
@@ -64,12 +64,23 @@ static int check_loader(const char *path) {
         assert(fread(ex, 1, ne, f) == ne && fread(mt, 1, nm, f) == nm);
         bfp_pack(&m, w);
         assert(!memcmp(ex, m.exp, ne) && !memcmp(mt, m.mant, nm));
+        int nt;                                  /* tt-metal's tiles of W^T, from loader.tt_tiles_ref (0: not whole tiles) */
+        assert(fread(&nt, 4, 1, f) == 1);
+        if (nt) {
+            uint8_t *tt = malloc(nt), *mine = malloc(nt);
+            assert(fread(tt, 1, nt, f) == (size_t)nt && (size_t)nt == bfp_tt_bytes(m.fmt, hdr[1], hdr[2]));
+            assert(bfp_to_tt_tiles(&m, mine) == 0 && !memcmp(tt, mine, nt));
+            free(tt); free(mine);
+            n_tt++;
+        }
         bfp_free(&m); free(w); free(ex); free(mt);
         n++;
     }
     fclose(f);
     assert(n > 0);
-    printf("loader.py packing == bfp_pack, byte for byte (%d matrices)\n", n);
+    printf("loader.py packing == bfp_pack, byte for byte (%d matrices); bfp_to_tt_tiles == tt-metal's tiles (%d)\n",
+           n, n_tt);
+    assert(n_tt > 0);
     return 0;
 }
 
