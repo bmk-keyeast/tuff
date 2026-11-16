@@ -63,6 +63,7 @@ class Ref:
         self.eos = c.eos_token_id[0] if isinstance(c.eos_token_id, list) else c.eos_token_id
         self.t = 0
         self.tokens = []
+        self.selected = {}                                                     # (layer, position) -> attended tokens
         self.state = {}
         for L, kind in enumerate(c.layer_types[:c.num_hidden_layers]):
             if kind == "linear_attention":
@@ -135,6 +136,7 @@ class Ref:
             score = np.maximum(iq @ bk.T, 0).sum(0) / math.sqrt(ihd)
             top = np.argsort(-score, kind="stable")[:min(c.indexer_budget // ratio, nb)]
             keep = sorted(i * ratio + r for i in top for r in range(ratio)) + keep
+        self.selected[L, t] = keep
         qg = self.lin(p + ".q_proj", x).reshape(H, 2 * hd)
         q, gate = qg[:, :hd], qg[:, hd:]
         q = self.rope(rms(q, self.w[p + ".q_norm.weight"], self.eps), t)
@@ -241,10 +243,19 @@ def check(T=40, seed=0):
         else:
             p.data = (0.3 if p.ndim == 1 else 1 / math.sqrt(p.shape[-1])) * torch.randn(p.shape, generator=g)
     ids = torch.randint(0, cfg.vocab_size, (1, T), generator=g)
+    masks = {}
+    for L, layer in enumerate(model.layers):
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.indexer.register_forward_hook(lambda m, a, o, L=L: masks.__setitem__(L, o[0, 0].numpy()))
     with torch.no_grad():
         want = model(input_ids=ids, use_cache=False).last_hidden_state[0].double().numpy()
     ref = Ref({k: v.numpy() for k, v in model.state_dict().items()}, cfg)
     got = np.stack([ref.step(int(t)) for t in ids[0]])
+    for (L, t), keep in sorted(ref.selected.items(), key=lambda x: (x[0][1], x[0][0])):
+        hf = sorted(np.flatnonzero(masks[L][t][:t + 1]).tolist())
+        if hf != sorted(keep):
+            print(f"indexer differs first at layer {L}, token {t}: transformers keeps {hf}, ref.py keeps {sorted(keep)}")
+            break
     err = np.abs(got - want).max(1) / np.abs(want).max(1)
     print(f"ref.py decode == transformers prefill: {T} tokens, {cfg.num_hidden_layers} layers "
           f"({cfg.layer_types.count('linear_attention')} DeltaNet, PLE before layer {cfg.ple_layer_ids[0] - 1}), "
