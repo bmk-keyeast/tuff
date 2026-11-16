@@ -69,6 +69,7 @@ class Ref:
         self.eos = c.eos_token_id[0] if isinstance(c.eos_token_id, list) else c.eos_token_id
         self.t = 0
         self.tokens = []
+        self.pos0 = 0                            # RoPE position of cache entry 0 (the MTP layer starts at 1)
         self.tie_break, self.ties = None, 0      # (layer, position) -> block ids, for ties at the top-k cutoff
         self.state = {}
         for L, kind in enumerate(c.layer_types[:c.num_hidden_layers]):
@@ -127,17 +128,18 @@ class Ref:
     # ---- full attention with the QSA indexer (sparse: the top blocks of keys plus the incomplete tail)
     def attention(self, L, x):
         c, s, p = self.c, self.state[L], f"layers.{L}.self_attn"
-        t, H, KV, hd = self.t, c.num_attention_heads, c.num_key_value_heads, c.head_dim
+        t, H, KV, hd = self.t, c.num_attention_heads, c.num_key_value_heads, c.head_dim   # t: index into the caches
+        pos = t + self.pos0                                                    # RoPE position
         nh, ihd, ratio = c.indexer_n_heads, c.indexer_head_dim, c.indexer_compress_ratio
         qk = self.lin(p + ".indexer.index_qk_proj", x)
         iq, s_key = qk[:nh * ihd].reshape(nh, ihd), qk[nh * ihd:]
         s["idx"].append(s_key)                                                 # raw: no norm, no rope
-        iq = self.rope(rms(iq, self.w[p + ".indexer.q_layernorm.weight"], self.eps), t)
+        iq = self.rope(rms(iq, self.w[p + ".indexer.q_layernorm.weight"], self.eps), pos)
         nb = (t + 1) // ratio
         keep = list(range(nb * ratio, t + 1))                                  # incomplete block: always kept
         if nb:
             blocks = np.array(s["idx"][:nb * ratio]).reshape(nb, ratio, ihd).mean(1)
-            bk = np.stack([self.rope(b, i * ratio) for i, b in
+            bk = np.stack([self.rope(b, i * ratio + self.pos0) for i, b in
                            enumerate(rms(blocks, self.w[p + ".indexer.k_layernorm.weight"], self.eps))])
             score = np.maximum(iq @ bk.T, 0).sum(0) / math.sqrt(ihd)
             n_top = min(c.indexer_budget // ratio, nb)
@@ -151,8 +153,8 @@ class Ref:
             keep = sorted(i * ratio + r for i in top for r in range(ratio)) + keep
         qg = self.lin(p + ".q_proj", x).reshape(H, 2 * hd)
         q, gate = qg[:, :hd], qg[:, hd:]
-        q = self.rope(rms(q, self.w[p + ".q_norm.weight"], self.eps), t)
-        k = self.rope(rms(self.lin(p + ".k_proj", x).reshape(KV, hd), self.w[p + ".k_norm.weight"], self.eps), t)
+        q = self.rope(rms(q, self.w[p + ".q_norm.weight"], self.eps), pos)
+        k = self.rope(rms(self.lin(p + ".k_proj", x).reshape(KV, hd), self.w[p + ".k_norm.weight"], self.eps), pos)
         s["K"].append(k)
         s["V"].append(self.lin(p + ".v_proj", x).reshape(KV, hd))
         Kc, Vc = np.array(s["K"])[keep], np.array(s["V"])[keep]               # [n, KV, hd]

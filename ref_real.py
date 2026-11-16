@@ -173,7 +173,7 @@ def main():
             hn = ref.rms(Rt, wh, cfg.rms_norm_eps, None if scope == "all streams" else d)
             h2 = np.stack([MW["fc_hidden.weight"] @ hn[s * d:(s + 1) * d] for s in range(hc)])
             e2 = MW["fc_embedding.weight"] @ ref.rms(W["embed_tokens.weight"][int(ids[t + 1])], MW["pre_fc_norm_embedding.weight"], cfg.rms_norm_eps)
-            m.t, m.tokens = t + 1, list(ids[:t + 2])
+            m.t, m.pos0, m.tokens = t, 1, list(ids[:t + 2])               # MTP cache entry t = position t + 1
             x = (h2 + e2[None]).ravel()
             x = m.mlp_block(0, m.attn_block(0, x))
             drafts.append(m.gated_residual("hyper_connection_mixer", x, combine=False))
