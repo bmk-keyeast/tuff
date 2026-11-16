@@ -250,6 +250,7 @@ class Ref:
             if after_layer:
                 after_layer(L)
         self.t, self.tokens = len(tokens), tokens
+        self.h4 = H                                                            # final 4-stream residuals (MTP input)
         return [self.gated_residual("hyper_connection_mixer", h, combine=False) for h in H]
 
 
