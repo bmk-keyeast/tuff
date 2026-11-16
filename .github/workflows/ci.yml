@@ -51,7 +51,7 @@ jobs:
       - run: apt-get update -qq && apt-get install -y -qq make > /dev/null
       - run: make -C kernels test_cuda
 
-  tp-check:     # the card/GPU tensor-parallel split is exact, on transformers' own Qwen4Exp layer code
+  hf-checks:    # against transformers' own Qwen4Exp code: exact card/GPU split, numpy decode reference
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,3 +59,4 @@ jobs:
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu
           pip install -q "transformers==5.23.0"
       - run: python tp_check.py
+      - run: python ref.py      # numpy decode recurrence == transformers' prefill, every token
