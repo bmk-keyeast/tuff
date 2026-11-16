@@ -72,6 +72,16 @@ Adaptive cache with up to 25 copies per token, hit rate measured on 'wikitext th
 | 8259CL, 6x32GB | tuff-mix | 90.1% | 41.3 | 67.3 | 77.3 | 147.6 |
 | 8259CL, 6x32GB | tuff-mix2 | 90.4% | 45.3 | 71.9 | 82.2 | 153.6 |
 
+### With an RTX 4060 Ti 16 GB next to the p150a
+
+Dense on the card as tuff's default (LM head and DeltaNet z in BFP4, the rest BFP8). One adaptive cache over the card's and the GPU's expert slots (up to 25 copies per token, hit rate measured on 'wikitext then code'); hits split between the devices by their slot counts. 'Split dense' also divides every dense matmul between the two (tensor parallel, partial sums meet in host memory, one extra round trip per layer). E5-2690 v4, 64 GB, batch 1, 4k context; MTP as above.
+
+| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | prose | chat | structured |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| p150a only | 0% | 10,019 + 0 | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 |
+| + 4060 Ti, expert cache | 0% | 10,019 + 5,631 | 97.1% | 44.1 | 73.7 | 84.9 | 163.1 |
+| + 4060 Ti, expert cache + split dense | 41% | 10,581 + 4,791 | 97.0% | 55.7 | 86.8 | 98.8 | 179.6 |
+
 ### Predicted decode with the measured hit rate
 
 plan.py's model with the hit rate measured for Basalt's profile on wikitext (E5-2690 v4, 64 GB, batch 1, no MTP).

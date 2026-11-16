@@ -458,6 +458,28 @@ def analyze(prof=None):
                     u = np.interp(1 + dl, ms, [win[x][0] for x in ms])
                     cells.append(f"{plan.decode_mtp(hh, u * hr, u * (1 - hr), 1 + dl, 1 + dl * acc, spec, promote=cp * (1 + dl * acc)):.1f}")
                 out.append(f"| {hn} | {d} | {hr:.1%} | " + " | ".join(cells) + " |")
+    if prof:
+        # an NVIDIA GPU next to the card: one adaptive cache over both devices' slots (an expert lives on one of them)
+        gpu = plan.GPUS["RTX 4060 Ti 16GB"]
+        out += ["\n### With an RTX 4060 Ti 16 GB next to the p150a\n",
+                "Dense on the card as tuff's default (LM head and DeltaNet z in BFP4, the rest BFP8). One adaptive cache "
+                "over the card's and the GPU's expert slots (up to 25 copies per token, hit rate measured on "
+                f"'{' then '.join(chunks)}'); hits split between the devices by their slot counts. 'Split dense' also "
+                "divides every dense matmul between the two (tensor parallel, partial sums meet in host memory, one "
+                "extra round trip per layer). E5-2690 v4, 64 GB, batch 1, 4k context; MTP as above.\n",
+                "| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | prose | chat | structured |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|"]
+        for name, g, sp in (("p150a only", None, False), ("+ 4060 Ti, expert cache", gpu, False),
+                            ("+ 4060 Ti, expert cache + split dense", gpu, True)):
+            s = plan.split_multi(g, MIX, split=sp) if g else dict(f=0.0, n_card=cap(MIX) * plan.QFN["L"] // L, n_gpu=0)
+            n_c, n_g = s["n_card"] * L // plan.QFN["L"], s["n_gpu"] * L // plan.QFN["L"]
+            hr, cp = simulate_cache(mix, n_c + n_g, 25, b, L * E)
+            sc, sg = n_c / (n_c + n_g), n_g / (n_c + n_g)
+            cells = []
+            for dl, acc in [(0, 0)] + list(scen.values()):
+                u = np.interp(1 + dl, ms, [win[x][0] for x in ms])
+                cells.append(f"{plan.decode_multi(host, g, u * hr * sc, u * hr * sg, u * (1 - hr), 1 + dl, 1 + dl * acc, MIX, sp, promote_card=cp * sc * (1 + dl * acc), promote_gpu=cp * sg * (1 + dl * acc)):.1f}")
+            out.append(f"| {name} | {s['f']:.0%} | {n_c:,} + {n_g:,} | {hr:.1%} | " + " | ".join(cells) + " |")
     if prof and "metrics" in z:
         key = ("Basalt's shipped profile", chunks[0])
         out += ["\n### Predicted decode with the measured hit rate\n",

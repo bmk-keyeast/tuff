@@ -122,22 +122,71 @@ def decode_mtp(host, hot, cold, m, accepted, dense_fmt="bfp8", expert_fmt="bfp4"
     in one pass, so the card reads its dense weights once per step instead of once per token.
     hot, cold: routed experts per layer that the m tokens need together, on the card and on the CPU (measured by
     trace.py). accepted: tokens emitted per step (1 + accepted drafts)."""
+    return decode_multi(host, None, hot, 0, cold, m, accepted, dense_fmt, expert_fmt=expert_fmt, ctx=ctx,
+                        promote_card=promote)
+
+
+# A second accelerator next to the p150a: an NVIDIA GPU on the same host. No peer-to-peer path exists between a
+# Tenstorrent card and an NVIDIA GPU, so everything they exchange goes through host memory.
+GPUS = {
+    # RTX 4060 Ti 16 GB: 288 GB/s GDDR6, PCIe 4.0 x8, i.e. PCIe 3.0 x8 (7.9 GB/s) in these hosts
+    "RTX 4060 Ti 16GB": dict(mem=16 * GiB, reserve=1.5 * GiB, bw=288 * GB, link=7.88 * GB),
+}
+# ponytail: guesses until measured. 0.6 of peak is what 4-bit GEMV kernels reach on Ada at batch 1; one CUDA hop per
+# layer (H2D, kernels in a graph, D2H) ~ 25 us
+GPU_EFF, GPU_RT_US = 0.60, 25.0
+REPLICATED = ("router", "hc", "ple")   # small or awkward to split: both devices keep a copy
+
+
+def split_multi(gpu, dense_fmt="bfp8", expert_fmt="bfp4", ctx=32768, split=True):
+    """Tensor-parallel split of the dense part between the p150a and `gpu` (heads of every attention / DeltaNet layer,
+    rows of every projection and of the LM head; REPLICATED groups on both), chosen so both finish together.
+    Returns the GPU's share f and how many routed experts each device has room for at this context."""
+    p, mm = params(), memory_map(dense_fmt, expert_fmt, ctx)
+    a, g = DEVICE["bw"] * DEVICE["eff"], gpu["bw"] * GPU_EFF
+    rep = sum(p[x] * B[fmt_of(dense_fmt, x)] for x in REPLICATED)
+    X = mm["dense"] - rep + mm["kv"] + mm["state"]                    # splittable bytes
+    f = min(1.0, max(0.0, (g * (rep + X) - a * rep) / (X * (a + g)))) if split else 0.0
+    card = DEVICE["mem"] - DEVICE["reserve"] - rep - (1 - f) * X     # f = 0: the whole dense part, as memory_map
+    gpu_room = gpu["mem"] - gpu["reserve"] - (rep + f * X if split else 0)
+    n = lambda room: max(0, int(room // mm["eb"]))
+    return dict(f=f, n_card=n(card), n_gpu=n(gpu_room), rep=rep, X=X)
+
+
+def decode_multi(host, gpu, u_card, u_gpu, u_cold, m=1, accepted=1, dense_fmt="bfp8", split=False, expert_fmt="bfp4",
+                 ctx=4096, promote_card=0, promote_gpu=0):
+    """Tokens/s for the p150a plus an optional NVIDIA GPU (gpu=None: card only). u_*: routed experts per layer per step
+    computed on each device (the m verified tokens together). split=True also splits the dense part between the two
+    (split_multi), at the cost of one more host round trip per layer: the attention block's partial sums meet in host
+    memory; the MLP block's meet there anyway, with the CPU's cold experts. promote_*: experts copied per step from
+    host RAM to each device by the adaptive cache."""
     p, q = params(), QFN
     mm = memory_map(dense_fmt, expert_fmt, ctx, host)
-    dev_bw, cpu_bw = DEVICE["bw"] * DEVICE["eff"], host["bw"] * CPU_EFF
-    b = {g: B[fmt_of(dense_fmt, g)] for g in DENSE}
+    a, cpu_bw = DEVICE["bw"] * DEVICE["eff"], host["bw"] * CPU_EFF
+    b = {x: B[fmt_of(dense_fmt, x)] for x in DENSE}
     # ponytail: card compute ignored; m <= 8 tokens stays bandwidth-bound on 120 Tensix cores
-    t_dense = (mm["dense"] + mm["kv"] * m + mm["state"]) / dev_bw
-    t_hot = q["L"] * hot * mm["eb"] / dev_bw
-    t_cold = (q["L"] * cold + promote) * mm["eb"] / cpu_bw         # promote: adaptive-cache copies per step
+    t_dense = (mm["dense"] + mm["kv"] * m + mm["state"]) / a
+    t_sync = 0.0
+    if gpu and split:
+        s = split_multi(gpu, dense_fmt, expert_fmt, ctx)
+        g = gpu["bw"] * GPU_EFF
+        X = s["X"] + mm["kv"] * (m - 1)
+        t_dense = max((s["rep"] + (1 - s["f"]) * X) / a, (s["rep"] + s["f"] * X) / g)
+        t_sync = q["L"] * PCIE_RT_US * 1e-6
+    t_hot = q["L"] * u_card * mm["eb"] / a
+    t_gpu = (q["L"] * (u_gpu * mm["eb"] / (gpu["bw"] * GPU_EFF) + GPU_RT_US * 1e-6)) if gpu and u_gpu else 0.0
+    t_cold = (q["L"] * u_cold + promote_card + promote_gpu) * mm["eb"] / cpu_bw
     t_pcie = q["L"] * (PCIE_RT_US * 1e-6 + 2 * m * q["d"] * 2 / (PCIE * PCIE_EFF))
     # one draft token: the MTP layer (full attention, shared expert, router, hyper-connections, two d x d input
     # projections, draft head over the reduced vocabulary) on the card, its 10 routed experts on the CPU
     mtp_dense = (p["attn_full"] * b["full"] + 3 * q["d"] * q["S"] * b["shared"] + q["d"] * q["E"] * b["router"]
                  + p["hc"] / q["L"] * b["hc"] + (2 * q["d"] ** 2 + DRAFT_VOCAB * q["d"]) * b["lm_head"])
-    t_draft = mtp_dense / dev_bw + q["k"] * mm["eb"] / cpu_bw + PCIE_RT_US * 1e-6
-    t = t_dense + max(t_hot, t_cold + t_pcie) + (m - 1) * t_draft
-    return accepted / max(t, t_pcie + promote * mm["eb"] / (PCIE * PCIE_EFF))
+    t_draft = mtp_dense / a + q["k"] * mm["eb"] / cpu_bw + PCIE_RT_US * 1e-6
+    t = t_dense + t_sync + max(t_hot, t_gpu, t_cold + t_pcie) + (m - 1) * t_draft
+    links = [t_pcie + promote_card * mm["eb"] / (PCIE * PCIE_EFF)]
+    if gpu:
+        links.append(promote_gpu * mm["eb"] / (gpu["link"] * PCIE_EFF))
+    return accepted / max([t] + links)
 
 
 def report():
@@ -192,6 +241,11 @@ def _check():
     # MTP with m = 1 and nothing accepted beyond the token itself is plain decode (no draft cost)
     h = memory_map(ctx=4096, host=HOSTS["E5-2690v4, 4x16GB"])["f"]    # decode()'s context
     assert abs(decode_mtp(HOSTS["E5-2690v4, 4x16GB"], 10 * h, 10 * (1 - h), 1, 1) - r_uni) < 1e-6 * r_uni
+    # a GPU that holds nothing and splits nothing changes nothing; a split puts the GPU's share where both finish
+    gpu = GPUS["RTX 4060 Ti 16GB"]
+    assert abs(decode_multi(HOSTS["E5-2690v4, 4x16GB"], gpu, 10 * h, 0, 10 * (1 - h)) - r_uni) < 1e-6 * r_uni
+    s = split_multi(gpu)
+    assert 0 < s["f"] < 0.5 and s["n_gpu"] > 0 and s["n_card"] > memory_map()["n_dev"]
 
 
 if __name__ == "__main__":
