@@ -517,10 +517,31 @@ def analyze(prof=None):
     print(text)
 
 
+def cache_check(prof, path):
+    """Writes the bf16 routing trace (prose then code) and simulate_cache's hit rates for kernels/test_cache.c."""
+    z = np.load(ROOT / "results" / "routes.npz")
+    R = z["routes"].astype(np.int64)[:, 0]                              # bf16 rows: [L, C, T, k]
+    L, C, T, k = R.shape
+    E = plan.QFN["E"]
+    seq = np.concatenate([(R[:, c] + (np.arange(L) * E)[:, None, None]).transpose(1, 0, 2) for c in range(C)])
+    init = basalt_order(prof, E)
+    init = init[init < L * E]
+    cases = [(n, bud, round(1e6 * simulate_cache(seq, n, bud, init, L * E)[0]))
+             for n in (4000, 9802) for bud in (0, 10, 25, 100)]
+    with open(path, "wb") as f:
+        np.array([len(seq), L * k, L * E, len(init), len(cases)], "<i4").tofile(f)
+        np.array(cases, "<i4").tofile(f)
+        init.astype("<i4").tofile(f)
+        seq.reshape(len(seq), -1).astype("<i4").tofile(f)
+    print(cases)
+
+
 if __name__ == "__main__":
     import sys
     sys.stdout.reconfigure(encoding="utf-8")
-    if len(sys.argv) > 1 and sys.argv[1] == "analyze":
+    if len(sys.argv) > 1 and sys.argv[1] == "cache-check":
+        cache_check(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 1 and sys.argv[1] == "analyze":
         analyze(sys.argv[2] if len(sys.argv) > 2 else None)
     else:
         main()

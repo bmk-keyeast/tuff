@@ -13,6 +13,11 @@ jobs:
       - run: make -C kernels test
       - name: loader.py packs exactly like bfp_pack
         run: pip install -q numpy && python loader.py selftest kernels/selftest.bin && ./kernels/test_bfp kernels/selftest.bin
+      - name: tcache replays the real routing trace like trace.py's simulate_cache
+        run: |
+          curl -sfLo basalt.prof https://raw.githubusercontent.com/jesdga95/basalt/main/data/profiles/qwen4exp-48x512.prof
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu   # trace.py imports it
+          python trace.py cache-check basalt.prof cache.bin && ./kernels/test_cache cache.bin
       - run: make -C kernels bench_bfp
       - name: build phase-0 kernel (baseline)
         run: |
