@@ -30,18 +30,21 @@ Part of the KEYEAST club's Tenstorrent work at Changwon Science High School.
 
 ## Headline
 
-Predicted decode, batch 1, 4k context, E5-2690 v4 with 64 GB, routed experts BFP4, dense weights on the card BFP8
-(the format whose accuracy cost is measured below as negligible). Hit rate measured on a real routing trace that switches
-from prose to code; MTP acceptance taken from Basalt's community benchmarks.
+Predicted decode, batch 1, 4k context, E5-2690 v4 with 64 GB, routed experts BFP4. Hit rate measured on a real routing
+trace that switches from prose to code; MTP acceptance taken from Basalt's community benchmarks. Dense formats: see
+[which dense groups tolerate BFP4](#which-dense-weights-tolerate-bfp4).
 
-| | no MTP | MTP, prose | MTP, chat | MTP, structured output |
-|---|---:|---:|---:|---:|
-| **tuff (adaptive cache + MTP)** | **37 t/s** | **60 t/s** | **68 t/s** | **126 t/s** |
-| static placement, Basalt's profile, no MTP | 27 t/s | | | |
+| Dense weights on the card | KLD (wikitext / code) | no MTP | MTP, prose | MTP, chat | MTP, structured output |
+|---|---:|---:|---:|---:|---:|
+| all BFP8 | 0.086 / 0.051 | 37 t/s | 59 t/s | 68 t/s | 126 t/s |
+| **tuff default: LM head + DeltaNet z in BFP4** | **0.113 / 0.060** | **41 t/s** | **66 t/s** | **76 t/s** | **142 t/s** |
+| tuff fast: + DeltaNet qkv in BFP4 | 0.131 / 0.073 | 45 t/s | 71 t/s | 81 t/s | 148 t/s |
+| static placement (Basalt's profile), all BFP8, no MTP | | 27 t/s | | | |
 
 How it gets there, each step measured on the real model on CI:
 
-1. **BFP4 experts + BFP8 dense cost about as much as Basalt's 4-bit packs**: KLD 0.05–0.09, 94–95% same top-1 token.
+1. **BFP4 experts cost about as much as Basalt's 4-bit packs** (KLD 0.05–0.09, 94–95% same top-1 token), and BFP4 is
+   affordable for some dense weights but not all: full attention in BFP4 alone costs 3.8 points of top-1.
 2. **A static hot-expert placement breaks when the topic changes**: Basalt's profile keeps 67% of routed experts on the
    card for prose but only 33% for code, worse than a uniform pick (40%).
 3. **An adaptive card cache fixes it**: copying up to 25 missed experts per token to the card (LRU eviction) holds ~90%
@@ -75,7 +78,7 @@ From `Qwen/Qwen3.8-Flash-Next` `config.json` (`qwen4_exp_text`):
 
 | Where | What |
 |---|---|
-| p150a (32 GB) | attention (all 48 layers), router, shared expert, hyper-connection mixers, LM head, KV cache and DeltaNet state, and a cache of routed experts: **~9,800 of 24,576 (40%)** at BFP4 with dense weights in BFP8 |
+| p150a (32 GB) | attention (all 48 layers), router, shared expert, hyper-connection mixers, LM head, KV cache and DeltaNet state, and a cache of routed experts: **~9,800 of 24,576 (40%)** at BFP4 with dense weights in BFP8 (BFP4 for the LM head and DeltaNet z: ~10,000) |
 | host DRAM | all routed experts (~68 GB in BFP4 with 128 GB of RAM, or the ~41 GB not on the card with 64 GB), computed in place by the CPU on a card miss; token embeddings; the MTP layer's experts |
 | NVMe or DRAM | the N-gram table (~28.8 GB quantized, as in Strata): memory-mapped from NVMe with 64 GB of RAM, resident in RAM with 128 GB. Each token reads only a few rows, and the row indices are known as soon as the previous token is sampled, so they can be prefetched |
 
@@ -97,13 +100,30 @@ The bf16 perplexity (wikitext 1.61, code 2.06) shows the streamed forward pass i
 | Format | Dense on card | Routed experts | KLD wikitext / code | Same top-1 wikitext / code |
 |---|---|---|---:|---:|
 | bfp4 | bf16 | BFP4 | 0.094 / 0.047 | 93.7% / 95.1% |
-| **tuff** | **BFP8** (LM head BFP8) | **BFP4** | **0.087 / 0.051** | **93.9% / 95.3%** |
-| tuff-fast | BFP4 (LM head BFP8) | BFP4 | 0.457 / 0.188 | 82.9% / 91.6% |
+| all-BFP8 dense | BFP8 | BFP4 | 0.087 / 0.051 | 93.9% / 95.3% |
+| **tuff default** | **BFP8, LM head + DeltaNet z BFP4** | **BFP4** | **0.113 / 0.060** | **92.4% / 94.5%** |
+| tuff fast | default + DeltaNet qkv BFP4 | BFP4 | 0.131 / 0.073 | 92.0% / 93.9% |
+| all-BFP4 dense | BFP4 (LM head BFP8) | BFP4 | 0.457 / 0.188 | 82.9% / 91.6% |
 
 - BFP8 for the dense part is free: the error is the experts' alone.
-- BFP4 for *every* dense projection is not: it would make decode ~55% faster on paper (58 → 166 t/s in the headline table)
-  but costs 11 points of top-1 on prose. The next step is per-projection precision, as blackhole-llm found for other models
-  (some projections are nearly free in BFP4, others are not).
+- BFP4 for the whole dense part is not, so [`results/dense_groups.md`](results/dense_groups.md) moves one group at a time
+  to BFP4 (everything else as in all-BFP8 dense):
+
+#### Which dense weights tolerate BFP4
+
+| Group | Params | Card memory saved | ΔKLD (mean of texts) | Δ top-1 |
+|---|---:|---:|---:|---:|
+| LM head | 636M | 0.32 GB | +0.007 | −1.0 pt |
+| DeltaNet z projection | 566M | 0.28 GB | +0.010 | −0.2 pt |
+| DeltaNet qkv projection | 944M | 0.47 GB | +0.026 | −1.3 pt |
+| hyper-connection mixers | 629M | 0.31 GB | +0.029 | −1.3 pt |
+| shared expert | 236M | 0.12 GB | +0.017 | −0.6 pt |
+| DeltaNet output projection | 566M | 0.28 GB | +0.048 | −2.0 pt |
+| full attention (12 layers, incl. indexer) | 617M | 0.31 GB | +0.117 | −3.8 pt |
+
+Sorted by KLD per GB saved. The two cheapest groups make the default; adding DeltaNet qkv makes "fast". A run of both
+mixes confirmed that the errors roughly add (default: +0.018 measured vs +0.017 predicted; fast: +0.034 vs +0.043).
+Full attention stays BFP8 in every mix: it is the reason all-BFP4 dense failed.
 
 **Routing** (share of the 10 routed experts per token and layer that a placement keeps on the card, 9,815 experts on card):
 
@@ -174,7 +194,7 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Real 48-layer forward pass on CI: model-level KLD / top-1 per format, routing trace
 - [x] Expert placement from routing traces: static profiles measured, adaptive LRU cache simulated
 - [x] Multi-token expert kernel for MTP verification
-- [ ] Per-projection precision for the dense part (which projections tolerate BFP4)
+- [x] Per-group precision for the dense part: LM head and DeltaNet z in BFP4, full attention must stay BFP8
 - [ ] Adaptive cache in engine code: miss queue, background PCIe copies, LRU on the card
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
 - [ ] Device path on the p150a with TT-NN: attention, shared and cached experts, hidden-state exchange; measure the real round trip
@@ -203,13 +223,14 @@ reporting set to "OS First" in the BIOS.
 - 로더: 360GB 체크포인트에서 필요한 전문가만 받아 BFP로 변환, C 패커와 바이트 단위로 동일
 - **실제 QFN 48층 전체 forward를 GitHub Actions에서 실행** (레이어 단위 스트리밍, 30분). BF16 퍼플렉서티가 정상이라 실행이 맞음을 확인
   - 전문가 BFP4 + 카드 쪽 가중치 BFP8: KLD 0.05~0.09, top-1 일치 94~95% (Basalt 4비트 팩 수준). BFP8 dense는 손해가 거의 없음
-  - dense까지 전부 BFP4로 하면 top-1이 83%로 떨어져서 그대로는 못 씀 → 프로젝션별로 정밀도를 다르게 줄 예정
+  - dense를 그룹별로 하나씩 BFP4로 바꿔 측정: LM head와 DeltaNet z는 거의 손해가 없고, 풀 어텐션은 손해가 커서 BFP8 유지
+  - 기본값: LM head + DeltaNet z만 BFP4 (KLD 0.113 / 0.060). 빠른 모드: DeltaNet qkv까지 BFP4
 - 실제 라우팅 기록 분석: Basalt의 고정 배치는 글에서 67%, 코드에서 33%만 카드에 적중. 적응형 캐시(놓친 전문가를 토큰당 25개까지 카드로 복사)는 주제가 바뀌어도 약 90% 적중
 
-**예측 속도 (E5-2690 v4, 64GB):** MTP 없이 37 t/s, MTP 사용 시 일반 글 60, 대화 68, 구조화 출력 126 t/s.
+**예측 속도 (E5-2690 v4, 64GB, 기본값):** MTP 없이 41 t/s, MTP 사용 시 일반 글 66, 대화 76, 구조화 출력 142 t/s (빠른 모드 45 / 71 / 81 / 148).
 실제 하드웨어 측정이 아니라 측정한 라우팅으로 계산한 예측입니다.
 
-**다음 할 일:** dense 프로젝션별 정밀도 결정, 적응형 캐시를 엔진 코드로 구현, 카드가 오면 TT-NN 카드 경로와 실측.
+**다음 할 일:** 적응형 캐시를 엔진 코드로 구현, 카드가 오면 TT-NN 카드 경로와 실측.
 
 ## License
 
