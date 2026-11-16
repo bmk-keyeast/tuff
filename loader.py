@@ -1,6 +1,6 @@
 """Qwen3.8-Flash-Next loader: routed experts from the BF16 checkpoint to tuff's host BFP layout.
 
-    python loader.py convert SRC OUT [--fmt bfp4] [--layers 0-47]  # SRC: local snapshot dir, or "hf" (HTTP)
+    python loader.py convert SRC OUT [--fmt bfp4] [--layers 0-47,mtp]  # SRC: local snapshot dir, or "hf" (HTTP)
     python loader.py accuracy [--layers 0,9,19,28,38,47] [--experts 8]  # real-weight accuracy -> results/
     python loader.py selftest FILE                                 # packed random matrices for kernels/test_bfp
     python loader.py fake DIR N [--fmt bfp4]                       # N random experts as layer 0, for kernels/test_store
@@ -30,6 +30,11 @@ REPO = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
 MBITS = {"bfp8": 7, "bfp4": 3}
 E, D, I = 512, 2560, 640
 EXPERT = "model.language_model.layers.{}.mlp.experts.{}"
+MTP_EXPERT = "mtp.layers.0.mlp.experts.{}"          # the MTP drafter's own 512 experts
+
+
+def expert_name(L, name):
+    return MTP_EXPERT.format(name) if L == "mtp" else EXPERT.format(L, name)
 
 
 class Source:
@@ -185,10 +190,10 @@ def convert(src, out, fmt, layers, n_experts=E):
     sizes = None
     for L in layers:
         t0 = time.time()
-        path = out / f"experts.{L:02d}.{fmt}"
+        path = out / (f"experts.mtp.{fmt}" if L == "mtp" else f"experts.{L:02d}.{fmt}")
         with open(path.with_suffix(".part"), "wb") as fh:
             for e in range(n_experts):
-                parts = [p for name in ("gate_up_proj", "down_proj") for p in pack(src.expert(EXPERT.format(L, name), e), fmt)]
+                parts = [p for name in ("gate_up_proj", "down_proj") for p in pack(src.expert(expert_name(L, name), e), fmt)]
                 sizes = sizes or [len(p) for p in parts]
                 for p in parts:
                     fh.write(p)
@@ -287,8 +292,16 @@ def fake(out, fmt, n):
 
 
 def layer_list(s):
-    return [int(x) for part in s.split(",") for x in
-            (range(int(part.split("-")[0]), int(part.split("-")[1]) + 1) if "-" in part else [part])]
+    """"0-47", "0,9,19", "mtp" (the drafter's experts -> experts.mtp.FMT), or a mix: "0-47,mtp"."""
+    out = []
+    for part in s.split(","):
+        if part == "mtp":
+            out.append("mtp")
+        elif "-" in part:
+            out += range(int(part.split("-")[0]), int(part.split("-")[1]) + 1)
+        else:
+            out.append(int(part))
+    return out
 
 
 if __name__ == "__main__":
