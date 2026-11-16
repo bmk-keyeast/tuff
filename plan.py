@@ -47,10 +47,11 @@ def params(m=QFN):
                 n_full=n_full, n_lin=n_lin,
                 # dense groups that can take different formats (trace.py measures each one's accuracy)
                 lin_qkv=n_lin * d * (2 * kd + vd), lin_z=n_lin * d * vd, lin_out=n_lin * vd * d,
-                lin_misc=n_lin * (d * 2 * m["lin_v_heads"] + (2 * kd + vd) * m["conv"]), full=n_full * full)
+                lin_misc=n_lin * (d * 2 * m["lin_v_heads"] + (2 * kd + vd) * m["conv"]), full=n_full * full,
+                ple=m["hc"] * d * d + d * d)    # N-gram embedding's key/value projections (one layer)
 
 
-DENSE = ("lin_qkv", "lin_z", "lin_out", "lin_misc", "full", "shared", "router", "hc", "lm_head")
+DENSE = ("lin_qkv", "lin_z", "lin_out", "lin_misc", "full", "shared", "router", "hc", "ple", "lm_head")
 
 
 def fmt_of(dense_fmt, group):
@@ -181,7 +182,7 @@ def _check():
     active = (p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"] + p["embed"]
               + QFN["L"] * QFN["k"] * p["expert"])
     assert 5.5e9 < active < 7.5e9, active   # published "~6B"; ours also counts embedding + LM head (1.3B)
-    assert sum(p[g] for g in DENSE) == p["attn"] + p["shared"] + p["router"] + p["hc"] + p["lm_head"]
+    assert sum(p[g] for g in DENSE) == p["attn"] + p["shared"] + p["router"] + p["hc"] + p["ple"] + p["lm_head"]
     assert dense_bytes({g: "bfp4" for g in DENSE}) == dense_bytes("bfp4")
     assert abs(p["ngram"] / 1e9 - 51.2) < 0.1               # published: ~51B N-gram embeddings
     mm = memory_map(host=HOSTS["E5-2690v4, 4x16GB"])

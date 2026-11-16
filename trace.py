@@ -40,7 +40,7 @@ MB = {"bfp8": 7, "bfp4": 3}
 # nn.Linear name inside a decoder layer -> plan.DENSE group; first match wins
 PATTERN = {"lin_qkv": "linear_attn.in_proj_qkv", "lin_z": "linear_attn.in_proj_z", "lin_out": "linear_attn.out_proj",
            "lin_misc": "linear_attn.", "full": "self_attn.", "shared": "shared_expert.", "router": "mlp.gate",
-           "hc": "hyper_connection."}
+           "hc": "hyper_connection.", "ple": "ple."}
 
 
 def dense_mb(spec, name):
