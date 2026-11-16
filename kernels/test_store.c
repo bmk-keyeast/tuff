@@ -33,9 +33,21 @@ int main(int argc, char **argv) {
         tstore_expert(&s, 0, e, &g, &u, &d);
         assert(tstore_bytes(&s, 0, e) == g.exp && ((uintptr_t)g.exp & 63) == 0);
         same(&g, gu); same(&u, gu + (size_t)I * D); same(&d, dn);
+        /* card copy: tiles of the whole gate_up matrix, then of down, the same size as the host copy */
+        bfp_mat m1, m2;
+        uint8_t *tt = malloc(s.expert_bytes), *ref = malloc(s.expert_bytes);
+        size_t n1 = bfp_tt_bytes(fmt, 2 * I, D);
+        assert(n1 + bfp_tt_bytes(fmt, D, I) == s.expert_bytes);
+        assert(bfp_alloc(&m1, fmt, 2 * I, D) == 0 && bfp_alloc(&m2, fmt, D, I) == 0);
+        bfp_pack(&m1, gu); bfp_pack(&m2, dn);
+        assert(bfp_to_tt_tiles(&m1, ref) == 0 && bfp_to_tt_tiles(&m2, ref + n1) == 0);
+        tstore_expert_tt(&s, 0, e, tt);
+        assert(!memcmp(tt, ref, s.expert_bytes));
+        bfp_free(&m1); bfp_free(&m2); free(tt); free(ref);
     }
     fclose(f);
-    printf("tstore (%s): %d experts of %zu bytes, views == bfp_pack\n", argv[2], s.experts, s.expert_bytes);
+    printf("tstore (%s): %d experts of %zu bytes, views == bfp_pack, card copies == bfp_to_tt_tiles\n", argv[2],
+           s.experts, s.expert_bytes);
     tstore_close(&s);
     free(gu); free(dn);
     return 0;

@@ -56,3 +56,12 @@ void tstore_expert(const tstore *s, int L, int e, bfp_mat *gate, bfp_mat *up, bf
     *up = (bfp_mat){s->fmt, I, D, gu_exp + panels * D, gu_mant + bfp_mant_bytes(s->fmt, I, D)};
     *down = (bfp_mat){s->fmt, D, I, dn, dn + s->piece[2]};
 }
+
+void tstore_expert_tt(const tstore *s, int L, int e, uint8_t *dst) {
+    const int D = TSTORE_D, I = TSTORE_I;
+    uint8_t *x = s->base[L] + (size_t)e * s->expert_bytes;
+    bfp_mat gu = {s->fmt, 2 * I, D, x, x + s->piece[0]};
+    bfp_mat dn = {s->fmt, D, I, x + s->piece[0] + s->piece[1], x + s->piece[0] + s->piece[1] + s->piece[2]};
+    bfp_to_tt_tiles(&gu, dst);
+    bfp_to_tt_tiles(&dn, dst + bfp_tt_bytes(s->fmt, 2 * I, D));
+}

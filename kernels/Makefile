@@ -14,8 +14,8 @@ bench_bfp: bench_bfp.c bfp.c bfp.h
 test_cache: test_cache.c cache.c cache.h
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined test_cache.c cache.c -o $@ $(LDLIBS)
 
-test_store: test_store.c store.c store.h bfp.c bfp.h
-	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined test_store.c store.c bfp.c -o $@ $(LDLIBS)
+test_store: test_store.c store.c store.h bfp.c tt_tile.c bfp.h
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined test_store.c store.c bfp.c tt_tile.c -o $@ $(LDLIBS)
 
 # NVIDIA GPU (RTX 4060 Ti = sm_89). Not part of `make all`: CI only compiles it; run ./test_cuda on the real box.
 NVCC ?= nvcc

@@ -28,5 +28,8 @@ int tstore_open(tstore *s, const char *dir, enum bfp_fmt fmt, int layers, int lo
 void tstore_close(tstore *s);
 /* views of expert e of layer L: gate [640][2560], up [640][2560], down [2560][640] */
 void tstore_expert(const tstore *s, int L, int e, bfp_mat *gate, bfp_mat *up, bfp_mat *down);
+/* expert e of layer L as the p150a stores it: TT tiles of gate_up^T [2560][1280] (gate columns 0..639, up 640..1279),
+ * then of down^T [640][2560]; expert_bytes in all, like the host copy. dst: expert_bytes. */
+void tstore_expert_tt(const tstore *s, int L, int e, uint8_t *dst);
 static inline const uint8_t *tstore_bytes(const tstore *s, int L, int e) { return s->base[L] + (size_t)e * s->expert_bytes; }
 #endif
