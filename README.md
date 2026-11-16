@@ -23,10 +23,12 @@ Sibling project: [blackhole-llm](https://github.com/bmk-keyeast/blackhole-llm) (
 Part of the KEYEAST club's Tenstorrent work at Changwon Science High School.
 
 > **Status (before the card arrives):** done and tested: the memory map, the decode-time model, the CPU expert kernels
-> (1-token and multi-token for MTP), the routed-expert loader, and a **real 48-layer QFN forward pass** that measures
-> model-level accuracy and records expert routing. Not done: the device path (TT-NN), the adaptive cache in engine code,
-> and the end-to-end engine. Every throughput number below is a **model prediction** fed by measured routing, not a
-> measurement on the target host.
+> (1-token and multi-token for MTP), the routed-expert loader, a **real 48-layer QFN forward pass** that measures
+> model-level accuracy and records expert routing, the adaptive expert cache in C (replayed on the real routing), the
+> memory-mapped expert store, and the per-group dense precision. Written but not run yet (no GPU in CI): CUDA kernels
+> for an optional RTX 4060 Ti. Not done: the device path (TT-NN) and the end-to-end engine. Every throughput number below
+> is a **model prediction** fed by measured routing, not a measurement on the target host
+> ([`bench/host.sh`](bench/host.sh) measures it once the host is built).
 
 ## Headline
 
@@ -40,6 +42,7 @@ trace that switches from prose to code; MTP acceptance taken from Basalt's commu
 | **tuff default: LM head + DeltaNet z in BFP4** | **0.113 / 0.060** | **41 t/s** | **66 t/s** | **76 t/s** | **142 t/s** |
 | tuff fast: + DeltaNet qkv in BFP4 | 0.131 / 0.073 | 45 t/s | 71 t/s | 81 t/s | 148 t/s |
 | static placement (Basalt's profile), all BFP8, no MTP | | 27 t/s | | | |
+| **default + an RTX 4060 Ti 16 GB** (dense split, shared expert cache) | 0.113 / 0.060 | **56 t/s** | **87 t/s** | **99 t/s** | **180 t/s** |
 
 How it gets there, each step measured on the real model on CI:
 
@@ -51,6 +54,8 @@ How it gets there, each step measured on the real model on CI:
    hits across the prose→code switch, and plan.py charges those copies to DRAM and PCIe bandwidth.
 4. **MTP verification amortizes the dense part**: 4 tokens touch 26 experts per layer, not 40, and the multi-token CPU kernel
    runs 4 tokens in 1.94× the time of one.
+5. **The card's dense part is the bottleneck, and a second GPU can share it**: see
+   [an RTX 4060 Ti next to the p150a](#an-rtx-4060-ti-next-to-the-p150a).
 
 ## The model
 
@@ -79,12 +84,41 @@ From `Qwen/Qwen3.8-Flash-Next` `config.json` (`qwen4_exp_text`):
 | Where | What |
 |---|---|
 | p150a (32 GB) | attention (all 48 layers), router, shared expert, hyper-connection mixers, LM head, KV cache and DeltaNet state, and a cache of routed experts: **~9,800 of 24,576 (40%)** at BFP4 with dense weights in BFP8 (BFP4 for the LM head and DeltaNet z: ~10,000) |
-| host DRAM | all routed experts (~68 GB in BFP4 with 128 GB of RAM, or the ~41 GB not on the card with 64 GB), computed in place by the CPU on a card miss; token embeddings; the MTP layer's experts |
+| host DRAM | all routed experts (68 GB in BFP4), memory-mapped from `loader.py convert`'s files and computed in place by the CPU on a card miss; token embeddings; the MTP layer's experts. The adaptive cache can promote any expert, so **128 GB keeps them all in RAM**; with 64 GB the least-used few GB fault in from NVMe |
 | NVMe or DRAM | the N-gram table (~28.8 GB quantized, as in Strata): memory-mapped from NVMe with 64 GB of RAM, resident in RAM with 128 GB. Each token reads only a few rows, and the row indices are known as soon as the previous token is sampled, so they can be prefetched |
 
 Per layer, the card runs attention, sends the hidden state to the host, both sides run their experts in parallel, and the
 host sends its partial sum back: `t_token = t_dense + max(t_hot, t_cold + t_pcie)`. Experts that missed are copied to the
 card in the background for the next token.
+
+## An RTX 4060 Ti next to the p150a
+
+The model says the card's dense weights (attention, DeltaNet, shared expert, LM head: ~4 GB read per token) take ~75% of
+a token, so more bandwidth for them is worth more than anything on the expert side. An RTX 4060 Ti 16 GB (288 GB/s) in
+the same host can supply it. The two cards cannot talk to each other directly, so everything they exchange goes through
+host memory over PCIe 3.0. Two ways to use it, from [`results/trace.md`](results/trace.md) (E5-2690 v4, 64 GB, tuff
+default formats, adaptive cache measured on the prose→code trace):
+
+| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | MTP prose | MTP chat | MTP structured |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| p150a only | – | 10,019 | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 |
+| + 4060 Ti as an expert cache | 0% | 10,019 + 5,631 | 97.1% | 44.1 | 73.7 | 84.9 | 163.1 |
+| **+ 4060 Ti, dense split + expert cache** | 41% | 10,581 + 4,791 | 97.0% | **55.7** | **86.8** | **98.8** | **179.6** |
+
+- **Expert cache only** helps little: at 90% card hits the CPU is no longer the slow side.
+- **Dense split (tensor parallel)** is what pays: every attention and DeltaNet layer is split by heads, the shared expert
+  and LM head by rows, and the two partial sums meet in host memory once per block. The split is exact:
+  [`tp_check.py`](tp_check.py) runs transformers' own Qwen4Exp layer code whole and as two halves and checks that the
+  halves add up (DeltaNet by key-head groups, attention by KV head with the QSA indexer copied to both, shared expert by
+  rows). It costs one extra host round trip per layer, which the model charges.
+- **The GPU uses the host's expert bytes as they are**: [`kernels/bfp_cuda.cu`](kernels/bfp_cuda.cu) decodes the same
+  offset-binary panels as the CPU kernel (a 128-thread block per 16-row panel, 512-byte coalesced reads), so one copy of
+  every expert in host RAM serves the CPU, the GPU and, after the byte permutation, the card. CI compiles it for sm_89;
+  its thread-to-dword mapping was replayed in numpy against the reference; [`kernels/test_cuda.cu`](kernels/test_cuda.cu)
+  checks it against the CPU and measures its bandwidth on the real GPU.
+- Guesses to replace with measurements: the GPU reaching 60% of 288 GB/s at batch 1, and 25 µs per layer for a CUDA hop.
+  Hardware: the board needs a second x8 (or wider) slot that fits next to the dual-slot p150a, and the PSU must carry
+  both cards (~300 W + ~165 W).
 
 ## Real forward pass: accuracy and routing
 
@@ -150,6 +184,11 @@ group of 4 tokens; on CI, 4 tokens take 1.94× the time of 1.
 | [`kernels/bfp.c`](kernels/bfp.c) | BFP8/BFP4 pack/unpack, shuffle-free AVX2+FMA GEMV, SwiGLU expert, `moe_forward` (one OpenMP region over all expert panels of a layer), `moe_forward_n` (n tokens per weight read, for MTP) |
 | [`loader.py`](loader.py) | Reads QFN's fused expert tensors from a local snapshot or over HTTP range requests, packs them bit-identically to the C packer, writes one memory-mappable file per layer (1.42 GB at BFP4, 68 GB for all 48), and measures real-weight accuracy |
 | [`trace.py`](trace.py) | Streamed real forward pass: model-level accuracy per format, routing trace, cache and MTP simulation → [`results/trace.md`](results/trace.md) |
+| [`kernels/cache.c`](kernels/cache.c) | `tcache`: the adaptive expert cache (card slots + optional GPU slots, LRU, copies per token); CI replays the real routing trace through it and matches `simulate_cache` within 0.1% |
+| [`kernels/store.c`](kernels/store.c) | `tstore`: memory-maps the converted layer files; gate, up and down of any expert are zero-copy `bfp_mat` views |
+| [`kernels/bfp_cuda.cu`](kernels/bfp_cuda.cu) | GEMV (1–4 tokens) and MoE layer on an NVIDIA GPU, same byte layout as the host; compiled in CI, not run yet |
+| [`tp_check.py`](tp_check.py) | The card/GPU tensor-parallel split is exact, on transformers' Qwen4Exp layer code |
+| [`bench/host.sh`](bench/host.sh) | Measures the real host: DRAM read bandwidth, cold experts per thread count, MTP, the GPU → `results/host_*.md` |
 | [`kernels/test_bfp.c`](kernels/test_bfp.c) | Exact round-trip, SIMD = scalar = fp64 math, SQNR bounds at QFN expert shapes, fused layer = sum of experts, multi-token = per-token, Python packer = C packer (ASan/UBSan) |
 | [`kernels/bench_bfp.c`](kernels/bench_bfp.c) | Cold-expert throughput at QFN shapes from a DRAM pool larger than the caches, 1–8 tokens |
 | [`.github/workflows/`](.github/workflows) | `ci` (build, test, benchmark every push), `accuracy` (sampled experts), `trace` (full forward pass) |
@@ -195,13 +234,17 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Expert placement from routing traces: static profiles measured, adaptive LRU cache simulated
 - [x] Multi-token expert kernel for MTP verification
 - [x] Per-group precision for the dense part: LM head and DeltaNet z in BFP4, full attention must stay BFP8
-- [ ] Adaptive cache in engine code: miss queue, background PCIe copies, LRU on the card
+- [x] Adaptive cache policy in engine code (`tcache`), replay-tested; memory-mapped expert store (`tstore`)
+- [x] RTX 4060 Ti: decode model, exact tensor-parallel split (checked), CUDA kernels on the host layout (compiled)
+- [ ] Copy engine: background PCIe copies of promoted experts to the card and the GPU (pinned host memory)
+- [ ] Run `test_cuda` and `bench/host.sh` on the real box; replace GPU_EFF, CPU_EFF and the round-trip guesses
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
 - [ ] Device path on the p150a with TT-NN: attention, shared and cached experts, hidden-state exchange; measure the real round trip
 - [ ] MTP speculative decoding end to end; measure QFN's own acceptance rate
 - [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
 - [ ] N-gram table on NVMe with prefetch
-- [ ] AVX-512 VNNI kernels for the 8259CL
+- [ ] AVX-512 kernels for the 8259CL, only if `bench/host.sh` shows cold experts compute-bound (on paper AVX2 already
+      outruns DRAM on both hosts: ~10 GB/s per core)
 - [ ] OpenAI- and Anthropic-compatible server
 
 ## Host notes for the p150a
@@ -230,7 +273,14 @@ reporting set to "OS First" in the BIOS.
 **예측 속도 (E5-2690 v4, 64GB, 기본값):** MTP 없이 41 t/s, MTP 사용 시 일반 글 66, 대화 76, 구조화 출력 142 t/s (빠른 모드 45 / 71 / 81 / 148).
 실제 하드웨어 측정이 아니라 측정한 라우팅으로 계산한 예측입니다.
 
-**다음 할 일:** 적응형 캐시를 엔진 코드로 구현, 카드가 오면 TT-NN 카드 경로와 실측.
+- 적응형 캐시를 C 엔진 코드(`tcache`)로 구현: 실제 라우팅 기록을 재생해 Python 시뮬레이션과 0.1% 이내로 일치
+- 변환된 전문가 파일을 복사 없이 바로 쓰는 저장소(`tstore`). 전문가 전체가 68GB라 적응형 캐시에는 128GB 램이 맞음
+- **RTX 4060 Ti 병렬 처리 검토 결과: 가능하고 효과가 큼.** 카드의 dense 연산을 헤드 단위로 나눠 4060 Ti와 같이 돌리면
+  예측 56 t/s (카드만 41), MTP 사용 시 87~180 t/s. 나누는 방식이 수학적으로 정확한지는 HF 코드로 검증(`tp_check.py`).
+  4060 Ti용 CUDA 커널도 작성(CI 컴파일 통과, 실제 GPU에서는 아직 미실행)
+- 실제 호스트가 준비되면 돌릴 측정 스크립트(`bench/host.sh`)
+
+**다음 할 일:** 카드가 오면 TT-NN 카드 경로와 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 
 ## License
 

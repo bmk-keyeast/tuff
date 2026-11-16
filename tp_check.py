@@ -76,7 +76,7 @@ def main():
     check("Gated DeltaNet, split by key-head groups", full(x), outs)
 
     # Full attention with the QSA indexer
-    att = next(i for i, t in enumerate(cfg.layer_types) if t == "full_attention")
+    att = next(i for i, t in enumerate(cfg.layer_types) if t != "linear_attention")   # "indexed_attention"
     full = M.Qwen4ExpTextAttention(cfg, att)
     randomize(full, 2)
     H, KV, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
