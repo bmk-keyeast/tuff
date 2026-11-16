@@ -1,6 +1,6 @@
 """Run the real Qwen3.8-Flash-Next forward pass on a machine with 16 GB of RAM, streaming the 360 GB checkpoint.
 
-    python trace.py [--tokens 1024] [--layers 48]       # -> results/trace.md, results/routes.npz
+    python trace.py [--tokens 1024] [--layers 48] [--formats bf16,tuff,...]       # -> results/trace.md, results/routes.npz
 
 Uses transformers' own Qwen4Exp modules, built on the meta device. Each decoder layer's weights are fetched with
 HTTP range requests just before it runs and dropped right after, routed experts only for the experts the router
@@ -33,7 +33,9 @@ from loader import Source
 REPO_ID = "Qwen/Qwen3.8-Flash-Next"
 CK = "model.language_model."                  # checkpoint prefix of the text model
 ABLATE = ("lin_qkv", "lin_z", "lin_out", "full", "shared", "hc", "lm_head")
-FORMATS = {"bf16": (None, None, None), "tuff": ({}, 3, 3), **{g: ({g: "bfp4"}, 3, 3) for g in ABLATE}}
+MIX = {"lm_head": "bfp4", "lin_z": "bfp4"}            # least KLD per GB saved (results/dense_groups.md)
+FORMATS = {"bf16": (None, None, None), "tuff": ({}, 3, 3), **{g: ({g: "bfp4"}, 3, 3) for g in ABLATE},
+           "tuff-mix": (MIX, 3, 3), "tuff-mix2": ({**MIX, "lin_qkv": "bfp4"}, 3, 3)}
 # (dense format: None = unquantized, else plan.fmt_of's {group: format} on top of bfp8; expert gate_up and down
 # mantissa bits, None = unquantized)
 MB = {"bfp8": 7, "bfp4": 3}
@@ -210,6 +212,8 @@ def texts(tok, T):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=1024)
+    ap.add_argument("--formats", default="bf16,tuff,tuff-mix,tuff-mix2",
+                    help="comma list of FORMATS; the per-group study: bf16,tuff," + ",".join(ABLATE))
     ap.add_argument("--layers", type=int, default=48, help="run only the first N layers (smoke test; no logits)")
     a = ap.parse_args()
     from transformers import AutoConfig, AutoTokenizer
@@ -221,7 +225,8 @@ def main():
     tok = AutoTokenizer.from_pretrained(REPO_ID)
     src = Source("hf")
     data = texts(tok, a.tokens)
-    chunks, fmts = list(data), list(FORMATS)
+    chunks, fmts = list(data), a.formats.split(",")
+    assert fmts[0] == "bf16" and all(f in FORMATS for f in fmts), fmts   # row 0 is the KLD reference
     C, Fn, T = len(chunks), len(fmts), a.tokens
     ids = torch.tensor([data[c] for c in chunks])                       # [C, T]
     batch_ids = ids.repeat(Fn, 1)                                       # row b = f * C + c
@@ -244,7 +249,7 @@ def main():
         if layer.ple is not None:
             emb = layer.ple.ple_embedding
             emb.ngram_embedding = NGramRows(src, f"{CK}layers.{L}.ple.ple_embedding.ngram_embedding")
-        layer.mlp.experts.forward = make_experts_forward(src, L, fmt_of_row, [(g, d) for _, g, d in FORMATS.values()],
+        layer.mlp.experts.forward = make_experts_forward(src, L, fmt_of_row, [FORMATS[f][1:] for f in fmts],
                                                          stats)
 
         def pre(mod, args, L=L):

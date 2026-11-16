@@ -6,6 +6,7 @@ on:
     inputs:
       tokens: { description: "tokens per text", default: "1024" }
       layers: { description: "decoder layers to run (48 = full model + analysis)", default: "48" }
+      formats: { description: "trace.py FORMATS to compare (first = bf16)", default: "bf16,tuff,tuff-mix,tuff-mix2" }
 
 permissions:
   contents: write
@@ -20,7 +21,7 @@ jobs:
           pip install -q torch --index-url https://download.pytorch.org/whl/cpu
           pip install -q "transformers==5.23.0" numpy pyarrow
       - run: curl -sfLo basalt.prof https://raw.githubusercontent.com/jesdga95/basalt/main/data/profiles/qwen4exp-48x512.prof
-      - run: python -u trace.py --tokens "${{ inputs.tokens }}" --layers "${{ inputs.layers }}"
+      - run: python -u trace.py --tokens "${{ inputs.tokens }}" --layers "${{ inputs.layers }}" --formats "${{ inputs.formats }}"
       - if: inputs.layers == '48'
         run: python trace.py analyze basalt.prof | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
