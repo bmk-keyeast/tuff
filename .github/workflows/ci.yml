@@ -42,3 +42,11 @@ jobs:
             echo "mtp  $(OMP_NUM_THREADS=$(nproc) ./kernels/bench_bfp 12 bfp4 2048 200 $n)" | tee -a bench.txt
           done
           { echo '```'; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  cuda-build:   # compile only: no GPU on hosted runners
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update -qq && apt-get install -y -qq make > /dev/null
+      - run: make -C kernels test_cuda

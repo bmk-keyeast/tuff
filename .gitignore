@@ -6,3 +6,5 @@ kernels/test_cache
 cache.bin
 basalt.prof
 kernels/test_store
+kernels/test_cuda
+kernels/bfp_host.o

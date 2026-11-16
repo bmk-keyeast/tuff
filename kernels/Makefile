@@ -17,11 +17,20 @@ test_cache: test_cache.c cache.c cache.h
 test_store: test_store.c store.c store.h bfp.c bfp.h
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined test_store.c store.c bfp.c -o $@ $(LDLIBS)
 
+# NVIDIA GPU (RTX 4060 Ti = sm_89). Not part of `make all`: CI only compiles it; run ./test_cuda on the real box.
+NVCC ?= nvcc
+CUDA_ARCH ?= sm_89
+bfp_host.o: bfp.c bfp.h
+	$(CC) $(CFLAGS) -c bfp.c -o $@
+
+test_cuda: test_cuda.cu bfp_cuda.cu bfp_cuda.h bfp_host.o
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -Xcompiler -fopenmp test_cuda.cu bfp_cuda.cu bfp_host.o -o $@ -lgomp -lm
+
 test: test_bfp test_cache
 	OMP_NUM_THREADS=4 ./test_bfp
 	./test_cache
 
 clean:
-	rm -f test_bfp test_cache test_store bench_bfp
+	rm -f test_bfp test_cache test_store bench_bfp test_cuda bfp_host.o
 
 .PHONY: all test clean
