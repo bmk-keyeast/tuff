@@ -145,41 +145,57 @@ def main():
     nll = -lp[np.arange(T - 1), ids[1:T]].mean()
     main_next = logits.argmax(1)                                          # greedy next token after each position
 
-    # MTP: QFN's drafter guesses the token after next from the final residual and the next token. Its layout follows
-    # Basalt's implementation (MIT); transformers has none. Not settled there: whether pre_fc_norm_hidden normalizes
-    # the 4 streams together or one by one, so both run. Acceptance = the draft equals the main model's greedy pick.
+    # MTP: QFN's drafter guesses the token after next from the final residual and the next token; chained, it feeds its
+    # own residual and guess back in. Its layout follows Basalt's implementation (MIT); transformers has none. Not
+    # settled there: whether pre_fc_norm_hidden normalizes the 4 streams together or one by one, so both run.
+    Wh = np.empty(shape, np.float32)                                      # LM head once in float32 (2.5 GB)
+    for i in range(0, shape[0], 16384):
+        Wh[i:i + 16384] = (u[i:i + 16384].astype(np.uint32) << 16).view(np.float32)
+    del u, data
+
     def head_argmax(X):
-        best = np.full(len(X), -np.inf), np.zeros(len(X), np.int64)
-        for i in range(0, shape[0], 16384):
-            lg = X.astype(np.float32) @ (u[i:i + 16384].astype(np.uint32) << 16).view(np.float32).T
-            j = lg.argmax(1)
-            m = lg[np.arange(len(X)), j] > best[0]
-            best[0][m], best[1][m] = lg[np.arange(len(X)), j][m], i + j[m]
-        return best[1]
+        return (np.atleast_2d(X).astype(np.float32) @ Wh.T).argmax(1)
 
     import copy
     mcfg = copy.deepcopy(cfg)
     mcfg.num_hidden_layers, mcfg.layer_types, mcfg.ple_layer_ids = 1, ["full_attention"], []
     MW = Checkpoint(src, mcfg, prefix="mtp.")
     MW.cache["embed_tokens.weight"] = W["embed_tokens.weight"]
-    d, hc = cfg.hidden_size, cfg.hc_count
+    d, hc, eps, DEPTH = cfg.hidden_size, cfg.hc_count, cfg.rms_norm_eps, 3
+
+    def mtp_step(m, R, tok, idx, scope):
+        """One drafter step: cache entry idx (RoPE position idx + 1); returns (its 4-stream residual, its guess)."""
+        hn = ref.rms(R, MW["pre_fc_norm_hidden.weight"], eps, None if scope == "all streams" else d)
+        h2 = np.stack([MW["fc_hidden.weight"] @ hn[s * d:(s + 1) * d] for s in range(hc)])
+        e2 = MW["fc_embedding.weight"] @ ref.rms(W["embed_tokens.weight"][int(tok)], MW["pre_fc_norm_embedding.weight"], eps)
+        m.t, m.pos0 = idx, 1
+        x = m.mlp_block(0, m.attn_block(0, (h2 + e2[None]).ravel()))
+        return x, int(head_argmax(m.gated_residual("hyper_connection_mixer", x, combine=False))[0])
+
+    # Greedy speculative decoding accepts draft k if drafts 1..k-1 were accepted and draft k equals the main model's
+    # greedy token. The text here is wikitext, not the model's own output, so draft k counts only where the text agrees
+    # with the main model's greedy picks up to there (the contexts are then the ones greedy decoding would have).
     accept = {}
     for scope in ("all streams", "per stream"):
         m = ref.Ref(MW, mcfg)
-        drafts = []
+        hit, tried = np.zeros(DEPTH), np.zeros(DEPTH)
         for t in range(T - 1):
-            Rt = r.h4[t]
-            wh = MW["pre_fc_norm_hidden.weight"]
-            hn = ref.rms(Rt, wh, cfg.rms_norm_eps, None if scope == "all streams" else d)
-            h2 = np.stack([MW["fc_hidden.weight"] @ hn[s * d:(s + 1) * d] for s in range(hc)])
-            e2 = MW["fc_embedding.weight"] @ ref.rms(W["embed_tokens.weight"][int(ids[t + 1])], MW["pre_fc_norm_embedding.weight"], cfg.rms_norm_eps)
-            m.t, m.pos0, m.tokens = t, 1, list(ids[:t + 2])               # MTP cache entry t = position t + 1
-            x = (h2 + e2[None]).ravel()
-            x = m.mlp_block(0, m.attn_block(0, x))
-            drafts.append(m.gated_residual("hyper_connection_mixer", x, combine=False))
-        guess = head_argmax(np.stack(drafts))                                 # draft for position t + 2
-        accept[scope] = (np.mean(guess[:T - 2] == main_next[1:T - 1]), np.mean(guess[:T - 2] == ids[2:T]))
-        print(f"MTP ({scope}): draft == main model's greedy token {accept[scope][0]:.1%}, == actual text {accept[scope][1]:.1%}", flush=True)
+            x, g = mtp_step(m, r.h4[t], ids[t + 1], t, scope)            # permanent cache entry for position t + 1
+            snap = copy.deepcopy(m.state)
+            ok = True
+            for k in range(DEPTH):
+                pos = t + 1 + k                                           # draft k + 1 predicts the token at pos + 1
+                if pos + 1 >= T or not ok or main_next[pos - 1] != ids[pos]:
+                    break
+                tried[k] += 1
+                ok = g == main_next[pos]
+                hit[k] += ok
+                if k + 1 < DEPTH and ok:
+                    x, g = mtp_step(m, x, g, t + 1 + k, scope)            # speculative entries, dropped below
+            m.state = snap
+        accept[scope] = [(hit[k] / max(tried[k], 1), int(tried[k])) for k in range(DEPTH)]
+        print(f"MTP ({scope}): " + ", ".join(f"draft {k + 1} accepted {a:.1%} of {n}" for k, (a, n) in enumerate(accept[scope])),
+              flush=True)
     overall = np.mean([x for _, _, x in rows])
     out = ["## ref.py on the real Qwen3.8-Flash-Next weights\n",
            f"First {T} tokens of the wikitext text in [`results/routes.npz`](routes.npz), every layer, float64. "
@@ -187,9 +203,10 @@ def main():
            f"did in trace.py's bf16 run. Next-token loss over the {T - 1} predictions: {nll:.3f} nats "
            f"(perplexity {np.exp(nll):.2f}; short context). Overall routing agreement {overall:.1%}. "
            f"Wall time {(time.time() - t0) / 60:.0f} min.\n",
-           "MTP drafter (one draft token, greedy), with pre_fc_norm_hidden over " + "; ".join(
-               f"{k}: matches the main model's next token {v[0]:.1%}, the text {v[1]:.1%}" for k, v in accept.items())
-           + f" (over {T - 2} positions).\n",
+           "MTP drafter, chained greedy drafts (draft k counted where drafts 1..k-1 were accepted and the text agrees "
+           "with the main model's greedy picks), with pre_fc_norm_hidden over " + "; ".join(
+               f"{sc}: " + ", ".join(f"draft {k + 1} {a:.1%} (n={n})" for k, (a, n) in enumerate(v)) for sc, v in accept.items())
+           + ".\n",
            "| Layer | Type | Routing agreement |", "|---:|---|---:|"]
     out += [f"| {L} | {k} | {x:.1%} |" for L, k, x in rows]
     text = "\n".join(out) + "\n"
