@@ -24,9 +24,10 @@ def main():
     x, y = rng.standard_normal((4, 96)), rng.standard_normal((4, 96))
     m, wt = rng.standard_normal((96, 64)), rng.standard_normal((64, 96)) / 10
     q = rng.standard_normal((4, 16))
-    qn, kn = q / np.linalg.norm(q, axis=1, keepdims=True), q[::-1] / np.linalg.norm(q[::-1], axis=1, keepdims=True)
-    v, g = rng.standard_normal((8, 16)), -np.abs(rng.standard_normal((1, 8)))
-    beta, S = 1 / (1 + np.exp(-rng.standard_normal((1, 8)))), 0.1 * rng.standard_normal((8, 16, 16))
+    qn = (q / np.linalg.norm(q, axis=1, keepdims=True)).reshape(1, 4, 16).repeat(3, 0)       # 3 tokens, 4 key heads
+    kn = qn[:, ::-1].copy()
+    v, g = rng.standard_normal((3, 8, 16)), -np.abs(rng.standard_normal((3, 8)))           # 8 value heads
+    beta, S = 1 / (1 + np.exp(-rng.standard_normal((3, 8)))), 0.1 * rng.standard_normal((8, 16, 16))
     tests = {
         "linear (weight bf16)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bf16")),
         "linear (weight bfp8)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bfp8")),
@@ -41,10 +42,13 @@ def main():
         "softmax": lambda o: o.softmax(o.put(x)),
         "reshape / slice / concat / transpose": lambda o: o.transpose(o.concat(
             [o.slice(o.reshape(o.put(x), (8, 48)), 1, 0, 16), o.slice(o.reshape(o.put(y), (8, 48)), 1, 16, 32)], 0)),
-        "gather_rows / write_row": lambda o: o.gather_rows(o.write_row(o.put(x), 2, o.put(y[:1])), [3, 2, 0]),
-        "topk (stable)": lambda o: o.put(np.asarray(o.topk(o.put(np.round(x[:1] * 4) / 4), 8)[1], np.float64)[None]),
-        "gated delta rule (4 key heads, 8 value heads)": lambda o: o.gdr(o.put(qn), o.put(kn), o.put(v), o.put(g),
-                                                                           o.put(beta), o.put(S), 0.25)[0],
+        "gather_rows / write_rows": lambda o: o.gather_rows(o.write_rows(o.put(x), 1, o.put(y[:2])), [3, 2, 0]),
+        "topk (stable, per row)": lambda o: o.put(np.asarray(o.topk(o.put(np.round(x * 4) / 4), 8)[1], np.float64)),
+        "gated delta rule, 3 tokens (output)": lambda o: o.gdr(o.put(qn), o.put(kn), o.put(v), o.put(g),
+                                                               o.put(beta), o.put(S), 0.25)[0],
+        "gated delta rule, 3 tokens (state after each)": lambda o: o.gdr(o.put(qn), o.put(kn), o.put(v), o.put(g),
+                                                                         o.put(beta), o.put(S), 0.25)[1],
+        "3-D reshape / mean / broadcast": lambda o: o.mean(o.mul(o.reshape(o.put(x), (4, 4, 24)), o.put(y[:1, :24])), 1),
     }
     bad = 0
     for name, f in tests.items():

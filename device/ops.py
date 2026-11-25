@@ -80,27 +80,33 @@ class Torch:
     def transpose(self, a): return a.transpose(-2, -1)
 
     def topk(self, a, k):
-        """k largest of a [1, n], ties to the lowest index (as ttnn.topk(stable=True)); indices come back to the host."""
-        order = np.argsort(-a.numpy()[0], kind="stable")[:k]
-        return a[:, order], order
+        """k largest of each row of a [m, n], ties to the lowest index (as ttnn.topk(stable=True)); returns (values
+        [m, k] on the card, indices [m, k] on the host)."""
+        idx = np.argsort(-a.numpy(), axis=1, kind="stable")[:, :k]
+        return self.t.gather(a, 1, self.t.from_numpy(idx)), idx
 
     def gather_rows(self, table, idx):
         return table[self.t.as_tensor(np.asarray(idx, np.int64))]
 
-    def write_row(self, table, i, row):
-        table[i] = row[0]
+    def write_rows(self, table, i, rows):
+        table[i:i + rows.shape[0]] = rows
         return table
 
     def gdr(self, q, k, v, g, beta, state, scale):
-        """One gated delta rule step (ttnn.transformer.fused_recurrent_gated_delta_rule, T = 1): q, k [H, K] (already
-        L2-normed), v [HV, V], g, beta [1, HV], state [HV, K, V]; key head i serves value heads i*HV/H ... Returns
-        (o [HV, V], new state)."""
-        G = v.shape[0] // q.shape[0]
-        q, k = q.repeat_interleave(G, 0) * scale, k.repeat_interleave(G, 0)
-        S = state * self.t.exp(g[0])[:, None, None]
-        delta = (v - self.t.einsum("hkv,hk->hv", S, k)) * beta[0][:, None]
-        S = S + k[:, :, None] * delta[:, None, :]
-        return self.t.einsum("hkv,hk->hv", S, q), S
+        """The gated delta rule over m tokens (ttnn.transformer.fused_recurrent_gated_delta_rule, T = m): q, k [m, H, K]
+        (already L2-normed), v [m, HV, V], g, beta [m, HV], state [HV, K, V]; key head i serves value heads
+        i*HV/H ... Returns (o [m, HV, V], the state after each token [m, HV, K, V]) -- per-token states let an MTP
+        verification keep exactly the accepted tokens."""
+        G = v.shape[1] // q.shape[1]
+        q, k = q.repeat_interleave(G, 1) * scale, k.repeat_interleave(G, 1)
+        S, outs, states = state, [], []
+        for i in range(q.shape[0]):
+            S = S * self.t.exp(g[i])[:, None, None]
+            delta = (v[i] - self.t.einsum("hkv,hk->hv", S, k[i])) * beta[i][:, None]
+            S = S + k[i][:, :, None] * delta[:, None, :]
+            outs.append(self.t.einsum("hkv,hk->hv", S, q[i]))
+            states.append(S)
+        return self.t.stack(outs), self.t.stack(states)
 
 
 class TTNN:
@@ -164,24 +170,25 @@ class TTNN:
 
     def topk(self, a, k):
         vals, idx = self.ttnn.topk(a, k, dim=-1, largest=True, sorted=True, stable=True)
-        return vals, self.ttnn.to_torch(idx).numpy().reshape(-1)[:k].astype(np.int64)
+        return vals, self.ttnn.to_torch(idx).numpy().reshape(a.shape[0], -1)[:, :k].astype(np.int64)
 
     def gather_rows(self, table, idx):
         # ponytail: through the host; ttnn.embedding (row-major table) once the KV cache layout is settled
         return self.put(self.get(table)[np.asarray(idx, np.int64)])
 
-    def write_row(self, table, i, row):
+    def write_rows(self, table, i, rows):
         # ponytail: through the host; ttnn.update_cache on a [1, 1, S, D] cache is the on-card version
         t = self.get(table)
-        t[i] = self.get(row)[0]
+        r = self.get(rows)
+        t[i:i + r.shape[0]] = r
         return self.put(t)
 
     def gdr(self, q, k, v, g, beta, state, scale):
         tt = self.ttnn
-        H, K = q.shape[-2], q.shape[-1]
+        m, H, K = q.shape
         HV, V = v.shape[-2], v.shape[-1]
         o, s = tt.transformer.fused_recurrent_gated_delta_rule(
-            tt.reshape(q, (1, 1, H, K)), tt.reshape(k, (1, 1, H, K)), tt.reshape(v, (1, 1, HV, V)),
-            tt.reshape(g, (1, 1, HV)), tt.reshape(beta, (1, 1, HV)), scale=scale,
-            initial_state=tt.reshape(state, (1, HV, K, V)), output_final_state=True)
-        return tt.reshape(o, (HV, V)), tt.reshape(s, (HV, K, V))
+            tt.reshape(q, (1, m, H, K)), tt.reshape(k, (1, m, H, K)), tt.reshape(v, (1, m, HV, V)),
+            tt.reshape(g, (1, m, HV)), tt.reshape(beta, (1, m, HV)), scale=scale,
+            initial_state=tt.reshape(state, (1, HV, K, V)), output_per_token_state=True)
+        return tt.reshape(o, (m, HV, V)), tt.reshape(s, (m, HV, K, V))

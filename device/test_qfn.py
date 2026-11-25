@@ -4,8 +4,12 @@
 
 1. formats f32: the card code must reproduce ref.py (float64) to float32 rounding, with experts split between card slots
    and the host and promoted between tokens.
-2. tuff's formats (dense: plan's default mix; experts BFP4, TT-exact): how far the card's rounding moves the output.
+2. verify(m tokens) + commit(m) == m single steps (the MTP verification pass).
+3. greedy speculative decoding emits exactly the tokens plain greedy decoding emits, with an oracle drafter (true
+   continuations, some corrupted: partial acceptance and rollback) and with QFN's MTP drafter layer.
+4. tuff's formats (dense: plan's default mix; experts BFP4, TT-exact): how far the card's rounding moves the output.
 """
+import copy
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,7 +108,38 @@ def weights(c, seed=0):
         w[p + "ple_embedding.ngram_heads_offsets"] = np.concatenate([[0], np.cumsum(primes)[:-1]])
         w[p + "ple_embedding.ngram_embedding.weight"] = rng.standard_normal((sum(primes), c.ple_embed_dim // heads))
     hyper("hyper_connection_mixer", combine=False)
+    mat("lm_head.weight", c.vocab_size, d)
     return w
+
+
+def mtp_weights(c, seed=2):
+    """An MTP drafter for the tiny model: one full-attention MoE layer, its mixer and the fc / pre_fc weights."""
+    mc = copy.deepcopy(c)
+    mc.layer_types, mc.num_hidden_layers, mc.ple_layer_ids = ["full_attention"], 1, []
+    w = {k: v for k, v in weights(mc, seed).items() if k.startswith(("layers.0.", "hyper_connection_mixer."))}
+    rng, d = np.random.default_rng(seed + 1), c.hidden_size
+    w["pre_fc_norm_hidden.weight"] = 0.3 * rng.standard_normal(c.hc_count * d)
+    w["pre_fc_norm_embedding.weight"] = 0.3 * rng.standard_normal(d)
+    w["fc_hidden.weight"] = rng.standard_normal((d, d)) / np.sqrt(d)
+    w["fc_embedding.weight"] = rng.standard_normal((d, d)) / np.sqrt(d)
+    return w
+
+
+class Oracle:
+    """Drafts the true greedy continuation, but every third step corrupts its second draft."""
+
+    def __init__(self, truth, n_prompt, vocab):
+        self.truth, self.n_prompt, self.vocab = truth, n_prompt, vocab
+
+    def catch_up(self, card, start, j):
+        pass
+
+    def propose(self, card, nxt, k):
+        pos = card.t - self.n_prompt                                       # index of nxt in the output
+        d = list(self.truth[pos + 1:pos + 1 + k]) + [0] * k
+        if pos % 3 == 2:
+            d[1] = (d[1] + 1) % self.vocab
+        return [int(x) for x in d[:k]]
 
 
 def run(card, T, ids):
@@ -126,6 +161,32 @@ def main(T=40):
     print(f"card code (ops.Torch, f32) == ref.py: {T} tokens, max relative error {err:.1e}, same experts {same:.1%}, "
           f"card slot hits {card.hits / card.lookups:.1%}")
     assert err < 1e-4 and same == 1.0, (err, same)
+
+    # 2. verify blocks == single steps
+    blocks = qfn.Card(Torch(), w, c, qfn.Host(w, c), dense_fmt="f32", expert_fmt="f32", slots=n_slots, budget=4)
+    got, i = [], 0
+    for m in [3, 1, 4, 2, 5, 1, 3, 6, 4, 2, 5, 4]:
+        got.append(blocks.o.get(blocks.verify(ids[i:i + m])))
+        blocks.commit(m)
+        i += m
+    got = np.concatenate(got)[:T]
+    err = (np.abs(got - want).max(1) / np.abs(want).max(1)).max()
+    print(f"verify(m tokens) + commit == single steps: max relative error {err:.1e}")
+    assert err < 1e-4, err
+
+    # 3. speculative == plain greedy
+    prompt, n = list(ids[:12]), 24
+    mk = lambda: qfn.Card(Torch(), w, c, qfn.Host(w, c), dense_fmt="f32", expert_fmt="f32", slots=n_slots, budget=4)
+    plain = mk()
+    truth = plain.generate(prompt, n)
+    for name, drafter, k in (("oracle drafter, 3 drafts", Oracle(truth, len(prompt), c.vocab_size), 3),
+                             ("QFN MTP drafter, 2 drafts", qfn.MTPDrafter(Torch(), mtp_weights(c), c, qfn.Host(w, c),
+                                                                         dense_fmt="f32", expert_fmt="f32"), 2)):
+        card = mk()
+        out = card.generate(prompt, n, drafter, k)
+        print(f"speculative greedy ({name}) == plain greedy: {out == truth}, {n} tokens in {card.steps} steps "
+              f"(plain: {plain.steps})")
+        assert out == truth
 
     tuff = qfn.Card(Torch(), w, c, qfn.Host(w, c), dense_fmt={"lm_head": "bfp4", "lin_z": "bfp4"}, expert_fmt="bfp4",
                     slots=n_slots, budget=4)

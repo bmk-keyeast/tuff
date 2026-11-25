@@ -217,21 +217,35 @@ drafts per step, close to this. The headline's "measured" column uses the per-st
 | hyper-connections, Gated DeltaNet (conv window and recurrent state stay on the card), full attention with the QSA indexer (KV cache, raw indexer keys and pooled block keys, the latter computed once per completed block), router, shared expert, the routed experts in the card's slots, final mixer, LM head | token embedding and N-gram rows (hashing + table on host RAM / NVMe), the routed experts not in a slot, the adaptive cache: after each token up to 25 missed experts are copied into slots (LRU) |
 
 Per layer only vectors cross the bus: the MoE input goes to the host when an expert misses, and the host's partial sum
-comes back. It is written in [`device/ops.py`](device/ops.py)'s operations, which have two backends:
+comes back.
+
+**MTP speculative decoding on the card.** `Card.verify(tokens)` runs the last token plus the drafts through every layer
+in one pass: each matmul takes all m rows (one read of the weights, which is what MTP buys), each slot expert runs once
+for every token routed to it, and only the recurrent parts (DeltaNet's conv and delta rule, the indexer's causal
+selection, attention) walk the tokens in order. `Card.commit(j)` keeps the first j: DeltaNet's per-token states (ttnn's
+delta-rule op returns them), the conv windows and the cache positions roll back to exactly that point.
+`MTPDrafter` is QFN's MTP layer on the card; its cache is caught up from the main model's residuals as tokens are
+accepted, and chained drafts feed its own residual back in. `Card.generate()` does greedy speculative decoding and is
+checked to emit **exactly the tokens plain greedy decoding emits**.
+
+It is written in [`device/ops.py`](device/ops.py)'s operations, which have two backends:
 
 - **`Torch`**: float32 on the CPU, with weights rounded through the card's formats (TT-exact BFP, bf16). CI runs the
   card code on it against ref.py ([`device/test_qfn.py`](device/test_qfn.py), tiny random QFN, 40 tokens): in float32 it
   matches ref.py to 1.6e-6 and routes to the same experts 100% of the time, with experts split between card slots and
   the host and promoted between tokens; in tuff's formats (dense BFP8 with the LM head and DeltaNet z in BFP4, card
-  experts BFP4) the median error is 7% and 96% of routing decisions agree.
+  experts BFP4) the median error is 7% and 96% of routing decisions agree. Verifying blocks of 1–6 tokens equals single
+  steps (2.3e-6), and speculative greedy decoding equals plain greedy decoding token for token, both with an oracle
+  drafter that is sometimes wrong (24 tokens in 8 steps instead of 24, partial acceptance and rollback exercised) and
+  with the MTP drafter layer.
 - **`TTNN`**: the same operations through ttnn, written from tt-metal's API and sources without a card. Gated DeltaNet
   uses ttnn's own `transformer.fused_recurrent_gated_delta_rule`, which also handles QFN's 16 key heads / 48 value heads
   and returns per-token states for MTP verification; top-k uses `ttnn.topk(stable=True)`, the same tie rule as ref.py.
   **First thing to run on the card**: [`device/test_ops.py`](device/test_ops.py) compares every TTNN operation with
   `Torch` and names the ones to fix.
 
-Not there yet: MTP verification batches on the card, fused ops and traces for speed, the C host side (tcache, tstore,
-moe_forward) under the card code, and the 4060 Ti's half of the split.
+Not there yet: fused ops and traces for speed, the C host side (tcache, tstore, moe_forward_n) under the card code,
+and the 4060 Ti's half of the split.
 
 ## What exists
 
@@ -305,7 +319,7 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Card code for the decode step (TT-NN backend + CPU backend), == ref.py on the CPU backend
 - [ ] On the card: `device/test_ops.py`, then the card code; measure the real round trip and the card's bandwidth
 - [x] QFN's MTP drafter in the reference, on the real weights: chained drafts accepted 71% / 52% / 36%, 2.08 tokens per step
-- [ ] MTP speculative decoding end to end; chained-draft acceptance on longer text
+- [x] MTP speculative decoding in the card code: verify + rollback, QFN's drafter, == plain greedy (CPU backend)
 - [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
 - [ ] N-gram table on NVMe with prefetch
 - [ ] AVX-512 kernels for the 8259CL, only if `bench/host.sh` shows cold experts compute-bound (on paper AVX2 already
@@ -351,6 +365,8 @@ reporting set to "OS First" in the BIOS.
 
 - **카드 코드 작성**(`device/`): 디코딩 한 스텝을 카드/호스트로 나눠 실행. CPU 백엔드에서 `ref.py`와 1.6e-6 이내로 같고 전문가 선택 100% 일치.
   ttnn 백엔드는 카드 없이 tt-metal 소스를 보고 작성. DeltaNet은 ttnn에 이미 있는 전용 연산(`fused_recurrent_gated_delta_rule`) 사용
+- **MTP 추측 디코딩을 카드 코드에 구현**: 여러 토큰을 한 번에 검증하고(가중치 한 번 읽기), 거절된 토큰만큼 상태를 정확히 되돌림.
+  QFN MTP 초안 모델도 카드 코드로 작성. 추측 디코딩 결과가 일반 greedy 생성과 토큰 단위로 완전히 같음을 확인
 
 **다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 
