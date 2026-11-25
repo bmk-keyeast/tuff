@@ -178,6 +178,27 @@ almost all of the in-sample upper bound. On the prose→code sequence, the cache
 experts for m = 1, 2, 3, 4 (measured on the trace). [`moe_forward_n`](kernels/bfp.c) streams each cold expert once per
 group of 4 tokens; on CI, 4 tokens take 1.94× the time of 1.
 
+## The decode recurrence, checked on the real model
+
+[`ref.py`](ref.py) writes QFN's decode step out in plain numpy, as the engine will run it: per token and per layer,
+DeltaNet's conv window and recurrent state, the KV cache with the QSA indexer, the PLE n-gram hashing and dilated conv,
+the hyper-connections and the MoE. It is the specification for the device path, and it is checked twice:
+
+- **against transformers on a tiny random model** (CI, every push): every token's hidden state matches within 4e-6. The
+  only freedom is torch.topk's unspecified order when indexer blocks tie at the cutoff, which ref.py resolves as lowest
+  block first.
+- **on the real 360 GB checkpoint** ([`ref_real.py`](ref_real.py), streamed layer by layer, 9 min on a GitHub runner):
+  for the first 48 tokens of the wikitext text, ref.py routes every token to **the same 10 experts as transformers did,
+  in all 48 layers (100.0%)**. Routing in a layer depends on everything before it, so this checks the whole recurrence on
+  real weights. Full table: [`results/ref_real.md`](results/ref_real.md).
+
+**QFN's own MTP drafter.** transformers does not implement the MTP layer, so its layout follows Basalt's (MIT): the final
+4-stream residual, normed and projected per stream by `fc_hidden`, plus the next token's embedding through `fc_embedding`,
+then one full-attention MoE layer, its own mixer and the main LM head. One-token drafts match the main model's greedy next
+token **60.9%** of the time on 46 wikitext positions (56.5% if `pre_fc_norm_hidden` normalizes the 4 streams jointly
+instead of one by one), in line with Basalt's community median for prose (66.75% per draft). The headline still uses
+Basalt's numbers; a longer measurement with chained drafts is next.
+
 ## What exists
 
 | Path | What |
@@ -191,6 +212,7 @@ group of 4 tokens; on CI, 4 tokens take 1.94× the time of 1.
 | [`kernels/bfp_cuda.cu`](kernels/bfp_cuda.cu) | GEMV (1–4 tokens) and MoE layer on an NVIDIA GPU, same byte layout as the host; compiled in CI, not run yet |
 | [`tp_check.py`](tp_check.py) | The card/GPU tensor-parallel split is exact, on transformers' Qwen4Exp layer code |
 | [`ref.py`](ref.py) | QFN decode as a per-token recurrence in plain numpy, keyed by checkpoint names: DeltaNet conv window and state, KV cache with the QSA indexer, PLE n-gram hashing and dilated conv, hyper-connections, MoE. The spec for the device path; CI checks it against transformers' prefill on a tiny random model |
+| [`ref_real.py`](ref_real.py) | ref.py on the real checkpoint, streamed: routing vs transformers in all 48 layers, next-token loss, QFN's MTP draft acceptance → [`results/ref_real.md`](results/ref_real.md) |
 | [`kernels/tt_tile.c`](kernels/tt_tile.c) | Host panels → Tenstorrent `bfp4_b`/`bfp8_b` tiles of W^T (8×8 nibble transposes + byte table, 1.1 GB/s per core); CI compares it with a port of tt-metal's `pack_as_bfp_tiles` |
 | [`bench/host.sh`](bench/host.sh) | Measures the real host: DRAM read bandwidth, cold experts per thread count, MTP, the GPU → `results/host_*.md` |
 | [`kernels/test_bfp.c`](kernels/test_bfp.c) | Exact round-trip, SIMD = scalar = fp64 math, SQNR bounds at QFN expert shapes, fused layer = sum of experts, multi-token = per-token, Python packer = C packer (ASan/UBSan) |
@@ -241,12 +263,13 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Adaptive cache policy in engine code (`tcache`), replay-tested; memory-mapped expert store (`tstore`)
 - [x] RTX 4060 Ti: decode model, exact tensor-parallel split (checked), CUDA kernels on the host layout (compiled)
 - [x] Host packing identical to tt-metal's; host → card tile conversion checked against tt-metal's packer
-- [x] Decode recurrence specified in numpy (`ref.py`) and checked against transformers
+- [x] Decode recurrence specified in numpy (`ref.py`), checked against transformers and on the real weights (100% routing)
 - [ ] Copy engine: background PCIe copies of promoted experts to the card and the GPU (pinned host memory)
 - [ ] Run `test_cuda` and `bench/host.sh` on the real box; replace GPU_EFF, CPU_EFF and the round-trip guesses
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
 - [ ] Device path on the p150a with TT-NN: attention, shared and cached experts, hidden-state exchange; measure the real round trip
-- [ ] MTP speculative decoding end to end; measure QFN's own acceptance rate
+- [x] QFN's MTP drafter in the reference: one-token drafts accepted 61% (46 positions)
+- [ ] MTP speculative decoding end to end; chained-draft acceptance on longer text
 - [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
 - [ ] N-gram table on NVMe with prefetch
 - [ ] AVX-512 kernels for the 8259CL, only if `bench/host.sh` shows cold experts compute-bound (on paper AVX2 already
@@ -288,6 +311,7 @@ reporting set to "OS First" in the BIOS.
 - 호스트 BFP 반올림을 tt-metal과 똑같이 맞춤(동률은 짝수 쪽). 이전에는 동률에서 달라 카드로 옮길 때 값이 미세하게 바뀔 수 있었음.
   호스트 형식 → 카드 타일 변환기(`tt_tile.c`)가 tt-metal 패커와 바이트 단위로 동일함을 확인
 - 디코딩 한 스텝을 numpy로 그대로 적은 기준 구현(`ref.py`): 카드 경로를 구현할 때의 명세. HF와 결과가 같은지 CI에서 확인
+- **실제 360GB 모델 가중치로도 검증**: 48개 층 전부에서 HF와 똑같은 전문가를 고름(100%). QFN 자체 MTP 초안 모델의 1토큰 초안이 본 모델 결과와 61% 일치
 
 **다음 할 일:** 카드가 오면 TT-NN 카드 경로와 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 
