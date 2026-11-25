@@ -211,6 +211,8 @@ def main():
     out += [f"| {L} | {k} | {x:.1%} |" for L, k, x in rows]
     text = "\n".join(out) + "\n"
     (ROOT / "results" / "ref_real.md").write_text(text, encoding="utf-8")
+    import json                                                           # trace.py analyze reads it for the headline
+    (ROOT / "results" / "mtp_accept.json").write_text(json.dumps({k: [[float(x), n] for x, n in v] for k, v in accept.items()}))
     print(text)
     # transformers ran in float32 from bf16 weights, ref.py in float64: near-ties at the 10th expert may flip
     assert overall > 0.95, overall

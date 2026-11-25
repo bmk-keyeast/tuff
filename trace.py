@@ -437,7 +437,15 @@ def analyze(prof=None):
             out.append(f"| {m} | {win[m][0]:.1f} | {win[m][1]:.1f} | {win[m][2]:.1f} |")
         ms = np.array(list(win))
         # Basalt community medians (docs/community/benchmarks.json, 20 runs): draft length, acceptance per draft
-        scen = {"prose": (1.8, 0.6675), "chat": (2.35, 0.7285), "structured": (6.9, 0.9835)}
+        basalt = {"prose": (1.8, 0.6675), "chat": (2.35, 0.7285), "structured": (6.9, 0.9835)}
+        # each scenario: the (tokens verified per step, tokens emitted per step) options; a row takes the fastest
+        scen = {k: [(1 + dl, 1 + dl * acc)] for k, (dl, acc) in basalt.items()}
+        acc_file = ROOT / "results" / "mtp_accept.json"                 # ref_real.py: QFN's own drafter, chained
+        if acc_file.exists():
+            import json
+            a = [x[0] for x in json.loads(acc_file.read_text())["per stream"]]
+            scen["QFN MTP (measured)"] = [(1 + k, 1 + sum(np.prod(a[:i + 1]) for i in range(k))) for k in range(1, len(a) + 1)]
+        U = lambda m: np.interp(m, ms, [win[x][0] for x in ms])         # unique experts per layer for m tokens
         # everything together: adaptive cache (25 copies per token) + MTP, on the topic-change sequence
         mix = seqs[" then ".join(chunks)] if C > 1 else seqs[chunks[0]]
 
@@ -448,15 +456,14 @@ def analyze(prof=None):
                 f"Adaptive cache with up to 25 copies per token, hit rate measured on '{' then '.join(chunks)}'. MTP "
                 "assumes Basalt's measured draft lengths and acceptance (community medians), with each step's experts "
                 "interpolated from the table above and split by that hit rate. Batch 1, 4k context.\n",
-                "| Host | Dense on card | Hit rate | no MTP | prose | chat | structured |", "|---|---|---:|---:|---:|---:|---:|"]
+                "| Host | Dense on card | Hit rate | no MTP | " + " | ".join(scen) + " |", "|---|---|---:|---:|" + "---:|" * len(scen)]
         for hn in ("E5-2690v4, 4x16GB", "8259CL, 6x32GB"):
             hh = plan.HOSTS[hn]
             for d, spec in dense_rows.items():
                 hr, cp = simulate_cache(mix, cap(spec), 25, b, L * E)
                 cells = [f"{plan.decode(hh, hr, spec, promote=cp)[0]:.1f}"]
-                for kind, (dl, acc) in scen.items():
-                    u = np.interp(1 + dl, ms, [win[x][0] for x in ms])
-                    cells.append(f"{plan.decode_mtp(hh, u * hr, u * (1 - hr), 1 + dl, 1 + dl * acc, spec, promote=cp * (1 + dl * acc)):.1f}")
+                for opts in scen.values():
+                    cells.append(f"{max(plan.decode_mtp(hh, U(m) * hr, U(m) * (1 - hr), m, e, spec, promote=cp * e) for m, e in opts):.1f}")
                 out.append(f"| {hn} | {d} | {hr:.1%} | " + " | ".join(cells) + " |")
     if prof:
         # an NVIDIA GPU next to the card: one adaptive cache over both devices' slots (an expert lives on one of them)
@@ -467,8 +474,8 @@ def analyze(prof=None):
                 f"'{' then '.join(chunks)}'); hits split between the devices by their slot counts. 'Split dense' also "
                 "divides every dense matmul between the two (tensor parallel, partial sums meet in host memory, one "
                 "extra round trip per layer). E5-2690 v4, 64 GB, batch 1, 4k context; MTP as above.\n",
-                "| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | prose | chat | structured |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|"]
+                "| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | " + " | ".join(scen) + " |",
+                "|---|---:|---:|---:|---:|" + "---:|" * len(scen)]
         for name, g, sp in (("p150a only", None, False), ("+ 4060 Ti, expert cache", gpu, False),
                             ("+ 4060 Ti, expert cache + split dense", gpu, True)):
             s = plan.split_multi(g, MIX, split=sp) if g else dict(f=0.0, n_card=cap(MIX) * plan.QFN["L"] // L, n_gpu=0)
@@ -476,9 +483,8 @@ def analyze(prof=None):
             hr, cp = simulate_cache(mix, n_c + n_g, 25, b, L * E)
             sc, sg = n_c / (n_c + n_g), n_g / (n_c + n_g)
             cells = []
-            for dl, acc in [(0, 0)] + list(scen.values()):
-                u = np.interp(1 + dl, ms, [win[x][0] for x in ms])
-                cells.append(f"{plan.decode_multi(host, g, u * hr * sc, u * hr * sg, u * (1 - hr), 1 + dl, 1 + dl * acc, MIX, sp, promote_card=cp * sc * (1 + dl * acc), promote_gpu=cp * sg * (1 + dl * acc)):.1f}")
+            for opts in [[(1, 1)]] + list(scen.values()):
+                cells.append(f"{max(plan.decode_multi(host, g, U(m) * hr * sc, U(m) * hr * sg, U(m) * (1 - hr), m, e, MIX, sp, promote_card=cp * sc * e, promote_gpu=cp * sg * e) for m, e in opts):.1f}")
             out.append(f"| {name} | {s['f']:.0%} | {n_c:,} + {n_g:,} | {hr:.1%} | " + " | ".join(cells) + " |")
     if prof and "metrics" in z:
         key = ("Basalt's shipped profile", chunks[0])

@@ -22,6 +22,6 @@ jobs:
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add results/ref_real.md
+          git add results/ref_real.md results/mtp_accept.json
           git commit -m "ref-real: ref.py on the real weights, ${{ inputs.tokens }} tokens"
           for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done; exit 1
