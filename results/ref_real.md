@@ -1,8 +1,8 @@
 ## ref.py on the real Qwen3.8-Flash-Next weights
 
-First 48 tokens of the wikitext text in [`results/routes.npz`](routes.npz), every layer, float64. Routing agreement = share of each token's 10 routed experts that ref.py picks the same as transformers did in trace.py's bf16 run. Next-token loss over the 47 predictions: 2.910 nats (perplexity 18.36; short context). Overall routing agreement 100.0%. Wall time 9 min.
+First 160 tokens of the wikitext text in [`results/routes.npz`](routes.npz), every layer, float64. Routing agreement = share of each token's 10 routed experts that ref.py picks the same as transformers did in trace.py's bf16 run. Next-token loss over the 159 predictions: 1.499 nats (perplexity 4.48; short context). Overall routing agreement 100.0%. Wall time 18 min.
 
-MTP drafter (one draft token, greedy), with pre_fc_norm_hidden over all streams: matches the main model's next token 56.5%, the text 30.4%; per stream: matches the main model's next token 60.9%, the text 30.4% (over 46 positions).
+MTP drafter, chained greedy drafts (draft k counted where drafts 1..k-1 were accepted and the text agrees with the main model's greedy picks), with pre_fc_norm_hidden over all streams: draft 1 64.8% (n=105), draft 2 52.7% (n=55), draft 3 34.8% (n=23); per stream: draft 1 71.4% (n=105), draft 2 51.7% (n=60), draft 3 36.4% (n=22).
 
 | Layer | Type | Routing agreement |
 |---:|---|---:|
