@@ -1,0 +1,65 @@
+"""Run this first on the card: every operation of ops.TTNN against ops.Torch, then the card code end to end.
+
+    python device/test_ops.py            # needs ttnn and a Tenstorrent device
+
+Each line says whether the ttnn version of one operation agrees with the CPU one (bf16 activations: ~1e-2 relative).
+A failure points at the one place to fix (ops.py's TTNN class), since device/qfn.py is already checked on ops.Torch.
+"""
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "device"))
+from ops import Torch, TTNN  # noqa: E402
+
+
+def main():
+    import ttnn
+    dev = ttnn.open_device(device_id=0)
+    a, b = Torch(), TTNN(dev)
+    rng = np.random.default_rng(0)
+    x, y = rng.standard_normal((4, 96)), rng.standard_normal((4, 96))
+    m, wt = rng.standard_normal((96, 64)), rng.standard_normal((64, 96)) / 10
+    q = rng.standard_normal((4, 16))
+    qn, kn = q / np.linalg.norm(q, axis=1, keepdims=True), q[::-1] / np.linalg.norm(q[::-1], axis=1, keepdims=True)
+    v, g = rng.standard_normal((8, 16)), -np.abs(rng.standard_normal((1, 8)))
+    beta, S = 1 / (1 + np.exp(-rng.standard_normal((1, 8)))), 0.1 * rng.standard_normal((8, 16, 16))
+    tests = {
+        "linear (weight bf16)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bf16")),
+        "linear (weight bfp8)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bfp8")),
+        "linear (weight bfp4)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bfp4")),
+        "matmul": lambda o: o.matmul(o.put(x), o.put(m)),
+        "add / mul / scale": lambda o: o.scale(o.add(o.mul(o.put(x), o.put(y)), o.put(y)), 0.5),
+        "broadcast [4,1] * [1,96]": lambda o: o.mul(o.put(x[:, :1]), o.put(y[:1])),
+        "silu / sigmoid / exp": lambda o: o.add(o.silu(o.put(x)), o.mul(o.sigmoid(o.put(y)), o.exp(o.scale(o.put(x), 0.1)))),
+        "softplus / relu / abs / sign": lambda o: o.add(o.softplus(o.put(x)), o.mul(o.relu(o.put(y)), o.sign(o.put(x)))),
+        "sqrt / rsqrt / clamp_min": lambda o: o.mul(o.sqrt(o.clamp_min(o.abs(o.put(x)), 1e-6)), o.rsqrt(o.add(o.abs(o.put(y)), 1.0))),
+        "sum / mean (dim 1 and 0)": lambda o: o.add(o.sum(o.put(x), 1), o.transpose(o.mean(o.put(x[:, :4]), 0))),
+        "softmax": lambda o: o.softmax(o.put(x)),
+        "reshape / slice / concat / transpose": lambda o: o.transpose(o.concat(
+            [o.slice(o.reshape(o.put(x), (8, 48)), 1, 0, 16), o.slice(o.reshape(o.put(y), (8, 48)), 1, 16, 32)], 0)),
+        "gather_rows / write_row": lambda o: o.gather_rows(o.write_row(o.put(x), 2, o.put(y[:1])), [3, 2, 0]),
+        "topk (stable)": lambda o: o.put(np.asarray(o.topk(o.put(np.round(x[:1] * 4) / 4), 8)[1], np.float64)[None]),
+        "gated delta rule (4 key heads, 8 value heads)": lambda o: o.gdr(o.put(qn), o.put(kn), o.put(v), o.put(g),
+                                                                           o.put(beta), o.put(S), 0.25)[0],
+    }
+    bad = 0
+    for name, f in tests.items():
+        try:
+            want, got = a.get(f(a)), b.get(f(b))
+            err = np.abs(got - want).max() / max(np.abs(want).max(), 1e-9)
+            ok = err < 3e-2
+        except Exception as e:                                       # noqa: BLE001 -- report every op, then fail
+            err, ok = repr(e)[:120], False
+        bad += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} {name}: {err if isinstance(err, str) else f'{err:.1e}'}")
+    ttnn.close_device(dev)
+    print("all ops agree" if not bad else f"{bad} ops to fix in ops.TTNN")
+    sys.exit(bad > 0)
+
+
+if __name__ == "__main__":
+    main()
