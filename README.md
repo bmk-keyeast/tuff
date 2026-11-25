@@ -28,7 +28,7 @@ Part of the KEYEAST club's Tenstorrent work at Changwon Science High School.
 > (1-token and multi-token for MTP), the routed-expert loader, a **real 48-layer QFN forward pass** that measures
 > model-level accuracy and records expert routing, the adaptive expert cache in C (replayed on the real routing), the
 > memory-mapped expert store, and the per-group dense precision. Written but not run yet (no GPU in CI): CUDA kernels
-> for an optional RTX 4060 Ti. Not done: the device path (TT-NN) and the end-to-end engine. Every throughput number below
+> for an optional RTX 4060 Ti. The card code is written and checked on the CPU backend; it has not run on a card yet. Every throughput number below
 > is a **model prediction** fed by measured routing, not a measurement on the target host
 > ([`bench/host.sh`](bench/host.sh) measures it once the host is built).
 
@@ -208,6 +208,31 @@ follows the main model's greedy picks:
 The per-stream reading accepts more, so tuff uses it. Basalt's community median for prose is 66.75% per draft at 1.8
 drafts per step, close to this. The headline's "measured" column uses the per-stream rates.
 
+## The card code
+
+[`device/qfn.py`](device/qfn.py) is ref.py's recurrence as the p150a will run it, with tuff's split of the work:
+
+| Card | Host |
+|---|---|
+| hyper-connections, Gated DeltaNet (conv window and recurrent state stay on the card), full attention with the QSA indexer (KV cache, raw indexer keys and pooled block keys, the latter computed once per completed block), router, shared expert, the routed experts in the card's slots, final mixer, LM head | token embedding and N-gram rows (hashing + table on host RAM / NVMe), the routed experts not in a slot, the adaptive cache: after each token up to 25 missed experts are copied into slots (LRU) |
+
+Per layer only vectors cross the bus: the MoE input goes to the host when an expert misses, and the host's partial sum
+comes back. It is written in [`device/ops.py`](device/ops.py)'s operations, which have two backends:
+
+- **`Torch`**: float32 on the CPU, with weights rounded through the card's formats (TT-exact BFP, bf16). CI runs the
+  card code on it against ref.py ([`device/test_qfn.py`](device/test_qfn.py), tiny random QFN, 40 tokens): in float32 it
+  matches ref.py to 1.6e-6 and routes to the same experts 100% of the time, with experts split between card slots and
+  the host and promoted between tokens; in tuff's formats (dense BFP8 with the LM head and DeltaNet z in BFP4, card
+  experts BFP4) the median error is 7% and 96% of routing decisions agree.
+- **`TTNN`**: the same operations through ttnn, written from tt-metal's API and sources without a card. Gated DeltaNet
+  uses ttnn's own `transformer.fused_recurrent_gated_delta_rule`, which also handles QFN's 16 key heads / 48 value heads
+  and returns per-token states for MTP verification; top-k uses `ttnn.topk(stable=True)`, the same tie rule as ref.py.
+  **First thing to run on the card**: [`device/test_ops.py`](device/test_ops.py) compares every TTNN operation with
+  `Torch` and names the ones to fix.
+
+Not there yet: MTP verification batches on the card, fused ops and traces for speed, the C host side (tcache, tstore,
+moe_forward) under the card code, and the 4060 Ti's half of the split.
+
 ## What exists
 
 | Path | What |
@@ -221,6 +246,7 @@ drafts per step, close to this. The headline's "measured" column uses the per-st
 | [`kernels/bfp_cuda.cu`](kernels/bfp_cuda.cu) | GEMV (1–4 tokens) and MoE layer on an NVIDIA GPU, same byte layout as the host; compiled in CI, not run yet |
 | [`tp_check.py`](tp_check.py) | The card/GPU tensor-parallel split is exact, on transformers' Qwen4Exp layer code |
 | [`ref.py`](ref.py) | QFN decode as a per-token recurrence in plain numpy, keyed by checkpoint names: DeltaNet conv window and state, KV cache with the QSA indexer, PLE n-gram hashing and dilated conv, hyper-connections, MoE. The spec for the device path; CI checks it against transformers' prefill on a tiny random model |
+| [`device/`](device) | The card code: `qfn.py` (decode step, card/host split, expert slots), `ops.py` (Torch and ttnn backends), `test_qfn.py` (== ref.py), `test_ops.py` (ttnn vs Torch, per operation, on the card) |
 | [`ref_real.py`](ref_real.py) | ref.py on the real checkpoint, streamed: routing vs transformers in all 48 layers, next-token loss, QFN's MTP draft acceptance → [`results/ref_real.md`](results/ref_real.md) |
 | [`kernels/tt_tile.c`](kernels/tt_tile.c) | Host panels → Tenstorrent `bfp4_b`/`bfp8_b` tiles of W^T (8×8 nibble transposes + byte table, 1.1 GB/s per core); CI compares it with a port of tt-metal's `pack_as_bfp_tiles` |
 | [`bench/host.sh`](bench/host.sh) | Measures the real host: DRAM read bandwidth, cold experts per thread count, MTP, the GPU → `results/host_*.md` |
@@ -276,7 +302,8 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [ ] Copy engine: background PCIe copies of promoted experts to the card and the GPU (pinned host memory)
 - [ ] Run `test_cuda` and `bench/host.sh` on the real box; replace GPU_EFF, CPU_EFF and the round-trip guesses
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
-- [ ] Device path on the p150a with TT-NN: attention, shared and cached experts, hidden-state exchange; measure the real round trip
+- [x] Card code for the decode step (TT-NN backend + CPU backend), == ref.py on the CPU backend
+- [ ] On the card: `device/test_ops.py`, then the card code; measure the real round trip and the card's bandwidth
 - [x] QFN's MTP drafter in the reference, on the real weights: chained drafts accepted 71% / 52% / 36%, 2.08 tokens per step
 - [ ] MTP speculative decoding end to end; chained-draft acceptance on longer text
 - [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
@@ -322,7 +349,10 @@ reporting set to "OS First" in the BIOS.
 - 디코딩 한 스텝을 numpy로 그대로 적은 기준 구현(`ref.py`): 카드 경로를 구현할 때의 명세. HF와 결과가 같은지 CI에서 확인
 - **실제 360GB 모델 가중치로도 검증**: 160토큰, 48개 층 전부에서 HF와 똑같은 전문가를 고름(100%). QFN 자체 MTP 초안 모델의 연속 초안 채택률 71% / 52% / 36% (스텝당 2.08토큰)
 
-**다음 할 일:** 카드가 오면 TT-NN 카드 경로와 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
+- **카드 코드 작성**(`device/`): 디코딩 한 스텝을 카드/호스트로 나눠 실행. CPU 백엔드에서 `ref.py`와 1.6e-6 이내로 같고 전문가 선택 100% 일치.
+  ttnn 백엔드는 카드 없이 tt-metal 소스를 보고 작성. DeltaNet은 ttnn에 이미 있는 전용 연산(`fused_recurrent_gated_delta_rule`) 사용
+
+**다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 
 ## License
 
