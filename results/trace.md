@@ -63,24 +63,24 @@ Mean over layers, texts and windows; placement = Basalt's profile with 9,802 exp
 
 Adaptive cache with up to 25 copies per token, hit rate measured on 'wikitext then code'. MTP assumes Basalt's measured draft lengths and acceptance (community medians), with each step's experts interpolated from the table above and split by that hit rate. Batch 1, 4k context.
 
-| Host | Dense on card | Hit rate | no MTP | prose | chat | structured |
-|---|---|---:|---:|---:|---:|---:|
-| E5-2690v4, 4x16GB | bfp8 | 89.7% | 37.0 | 59.3 | 67.8 | 125.7 |
-| E5-2690v4, 4x16GB | tuff-mix | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 |
-| E5-2690v4, 4x16GB | tuff-mix2 | 90.4% | 45.3 | 70.6 | 80.5 | 147.6 |
-| 8259CL, 6x32GB | bfp8 | 89.7% | 37.2 | 60.2 | 69.0 | 130.1 |
-| 8259CL, 6x32GB | tuff-mix | 90.1% | 41.3 | 67.3 | 77.3 | 147.6 |
-| 8259CL, 6x32GB | tuff-mix2 | 90.4% | 45.3 | 71.9 | 82.2 | 153.6 |
+| Host | Dense on card | Hit rate | no MTP | prose | chat | structured | QFN MTP (measured) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| E5-2690v4, 4x16GB | bfp8 | 89.7% | 37.0 | 59.3 | 67.8 | 125.7 | 54.5 |
+| E5-2690v4, 4x16GB | tuff-mix | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 | 60.9 |
+| E5-2690v4, 4x16GB | tuff-mix2 | 90.4% | 45.3 | 70.6 | 80.5 | 147.6 | 64.8 |
+| 8259CL, 6x32GB | bfp8 | 89.7% | 37.2 | 60.2 | 69.0 | 130.1 | 55.4 |
+| 8259CL, 6x32GB | tuff-mix | 90.1% | 41.3 | 67.3 | 77.3 | 147.6 | 61.9 |
+| 8259CL, 6x32GB | tuff-mix2 | 90.4% | 45.3 | 71.9 | 82.2 | 153.6 | 66.1 |
 
 ### With an RTX 4060 Ti 16 GB next to the p150a
 
 Dense on the card as tuff's default (LM head and DeltaNet z in BFP4, the rest BFP8). One adaptive cache over the card's and the GPU's expert slots (up to 25 copies per token, hit rate measured on 'wikitext then code'); hits split between the devices by their slot counts. 'Split dense' also divides every dense matmul between the two (tensor parallel, partial sums meet in host memory, one extra round trip per layer). E5-2690 v4, 64 GB, batch 1, 4k context; MTP as above.
 
-| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | prose | chat | structured |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| p150a only | 0% | 10,019 + 0 | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 |
-| + 4060 Ti, expert cache | 0% | 10,019 + 5,631 | 97.1% | 44.1 | 73.7 | 84.9 | 163.1 |
-| + 4060 Ti, expert cache + split dense | 41% | 10,581 + 4,791 | 97.0% | 55.7 | 86.8 | 98.8 | 179.6 |
+| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | prose | chat | structured | QFN MTP (measured) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| p150a only | 0% | 10,019 + 0 | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 | 60.9 |
+| + 4060 Ti, expert cache | 0% | 10,019 + 5,631 | 97.1% | 44.1 | 73.7 | 84.9 | 163.1 | 68.0 |
+| + 4060 Ti, expert cache + split dense | 41% | 10,581 + 4,791 | 97.0% | 55.7 | 86.8 | 98.8 | 179.6 | 79.6 |
 
 ### Predicted decode with the measured hit rate
 

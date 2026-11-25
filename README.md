@@ -35,16 +35,18 @@ Part of the KEYEAST club's Tenstorrent work at Changwon Science High School.
 ## Headline
 
 Predicted decode, batch 1, 4k context, E5-2690 v4 with 64 GB, routed experts BFP4. Hit rate measured on a real routing
-trace that switches from prose to code; MTP acceptance taken from Basalt's community benchmarks. Dense formats: see
-[which dense groups tolerate BFP4](#which-dense-weights-tolerate-bfp4).
+trace that switches from prose to code. **MTP, measured**: QFN's own drafter run on the real weights
+([`ref_real.py`](ref_real.py)), chained greedy drafts on wikitext: draft 1 accepted 71%, draft 2 52%, draft 3 36%
+(2 drafts per step is fastest, 2.08 tokens per step). The chat and structured columns borrow Basalt's community
+acceptance for those kinds of text. Dense formats: see [which dense groups tolerate BFP4](#which-dense-weights-tolerate-bfp4).
 
-| Dense weights on the card | KLD (wikitext / code) | no MTP | MTP, prose | MTP, chat | MTP, structured output |
+| Dense weights on the card | KLD (wikitext / code) | no MTP | **MTP, measured (prose)** | MTP, chat (Basalt's rate) | MTP, structured (Basalt's rate) |
 |---|---:|---:|---:|---:|---:|
-| all BFP8 | 0.086 / 0.051 | 37 t/s | 59 t/s | 68 t/s | 126 t/s |
-| **tuff default: LM head + DeltaNet z in BFP4** | **0.113 / 0.060** | **41 t/s** | **66 t/s** | **76 t/s** | **142 t/s** |
-| tuff fast: + DeltaNet qkv in BFP4 | 0.131 / 0.073 | 45 t/s | 71 t/s | 81 t/s | 148 t/s |
+| all BFP8 | 0.086 / 0.051 | 37 t/s | 55 t/s | 68 t/s | 126 t/s |
+| **tuff default: LM head + DeltaNet z in BFP4** | **0.113 / 0.060** | **41 t/s** | **61 t/s** | **76 t/s** | **142 t/s** |
+| tuff fast: + DeltaNet qkv in BFP4 | 0.131 / 0.073 | 45 t/s | 65 t/s | 81 t/s | 148 t/s |
 | static placement (Basalt's profile), all BFP8, no MTP | | 27 t/s | | | |
-| **default + an RTX 4060 Ti 16 GB** (dense split, shared expert cache) | 0.113 / 0.060 | **56 t/s** | **87 t/s** | **99 t/s** | **180 t/s** |
+| **default + an RTX 4060 Ti 16 GB** (dense split, shared expert cache) | 0.113 / 0.060 | **56 t/s** | **80 t/s** | **99 t/s** | **180 t/s** |
 
 How it gets there, each step measured on the real model on CI:
 
@@ -54,8 +56,8 @@ How it gets there, each step measured on the real model on CI:
    card for prose but only 33% for code, worse than a uniform pick (40%).
 3. **An adaptive card cache fixes it**: copying up to 25 missed experts per token to the card (LRU eviction) holds ~90%
    hits across the prose→code switch, and plan.py charges those copies to DRAM and PCIe bandwidth.
-4. **MTP verification amortizes the dense part**: 4 tokens touch 26 experts per layer, not 40, and the multi-token CPU kernel
-   runs 4 tokens in 1.94× the time of one.
+4. **MTP verification amortizes the dense part**: 4 tokens touch 26 experts per layer, not 40, the multi-token CPU kernel
+   runs 4 tokens in 1.94× the time of one, and QFN's own drafter gets 2.08 tokens per step on prose.
 5. **The card's dense part is the bottleneck, and a second GPU can share it**: see
    [an RTX 4060 Ti next to the p150a](#an-rtx-4060-ti-next-to-the-p150a).
 
@@ -101,11 +103,11 @@ the same host can supply it. The two cards cannot talk to each other directly, s
 host memory over PCIe 3.0. Two ways to use it, from [`results/trace.md`](results/trace.md) (E5-2690 v4, 64 GB, tuff
 default formats, adaptive cache measured on the prose→code trace):
 
-| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | MTP prose | MTP chat | MTP structured |
+| Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | MTP, measured (prose) | MTP chat (Basalt's rate) | MTP structured (Basalt's rate) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| p150a only | – | 10,019 | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 |
-| + 4060 Ti as an expert cache | 0% | 10,019 + 5,631 | 97.1% | 44.1 | 73.7 | 84.9 | 163.1 |
-| **+ 4060 Ti, dense split + expert cache** | 41% | 10,581 + 4,791 | 97.0% | **55.7** | **86.8** | **98.8** | **179.6** |
+| p150a only | – | 10,019 | 90.1% | 41.3 | 60.9 | 75.8 | 142.1 |
+| + 4060 Ti as an expert cache | 0% | 10,019 + 5,631 | 97.1% | 44.1 | 68.0 | 84.9 | 163.1 |
+| **+ 4060 Ti, dense split + expert cache** | 41% | 10,581 + 4,791 | 97.0% | **55.7** | **79.6** | **98.8** | **179.6** |
 
 - **Expert cache only** helps little: at 90% card hits the CPU is no longer the slow side.
 - **Dense split (tensor parallel)** is what pays: every attention and DeltaNet layer is split by heads, the shared expert
@@ -194,10 +196,17 @@ the hyper-connections and the MoE. It is the specification for the device path, 
 
 **QFN's own MTP drafter.** transformers does not implement the MTP layer, so its layout follows Basalt's (MIT): the final
 4-stream residual, normed and projected per stream by `fc_hidden`, plus the next token's embedding through `fc_embedding`,
-then one full-attention MoE layer, its own mixer and the main LM head. One-token drafts match the main model's greedy next
-token **60.9%** of the time on 46 wikitext positions (56.5% if `pre_fc_norm_hidden` normalizes the 4 streams jointly
-instead of one by one), in line with Basalt's community median for prose (66.75% per draft). The headline still uses
-Basalt's numbers; a longer measurement with chained drafts is next.
+then one full-attention MoE layer, its own mixer and the main LM head; a chained draft feeds the layer's own residual and
+guess back in. On 160 wikitext tokens (routing still 100% in all 48 layers), with greedy acceptance counted where the text
+follows the main model's greedy picks:
+
+| `pre_fc_norm_hidden` over | draft 1 | draft 2 (after 1 accepted) | draft 3 (after 2) | tokens per step, 2 drafts |
+|---|---:|---:|---:|---:|
+| **each stream** | **71.4%** (n=105) | **51.7%** (n=60) | **36.4%** (n=22) | **2.08** |
+| all 4 streams jointly | 64.8% (n=105) | 52.7% (n=55) | 34.8% (n=23) | 1.99 |
+
+The per-stream reading accepts more, so tuff uses it. Basalt's community median for prose is 66.75% per draft at 1.8
+drafts per step, close to this. The headline's "measured" column uses the per-stream rates.
 
 ## What exists
 
@@ -268,7 +277,7 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [ ] Run `test_cuda` and `bench/host.sh` on the real box; replace GPU_EFF, CPU_EFF and the round-trip guesses
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
 - [ ] Device path on the p150a with TT-NN: attention, shared and cached experts, hidden-state exchange; measure the real round trip
-- [x] QFN's MTP drafter in the reference: one-token drafts accepted 61% (46 positions)
+- [x] QFN's MTP drafter in the reference, on the real weights: chained drafts accepted 71% / 52% / 36%, 2.08 tokens per step
 - [ ] MTP speculative decoding end to end; chained-draft acceptance on longer text
 - [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
 - [ ] N-gram table on NVMe with prefetch
@@ -299,7 +308,7 @@ reporting set to "OS First" in the BIOS.
   - 기본값: LM head + DeltaNet z만 BFP4 (KLD 0.113 / 0.060). 빠른 모드: DeltaNet qkv까지 BFP4
 - 실제 라우팅 기록 분석: Basalt의 고정 배치는 글에서 67%, 코드에서 33%만 카드에 적중. 적응형 캐시(놓친 전문가를 토큰당 25개까지 카드로 복사)는 주제가 바뀌어도 약 90% 적중
 
-**예측 속도 (E5-2690 v4, 64GB, 기본값):** MTP 없이 41 t/s, MTP 사용 시 일반 글 66, 대화 76, 구조화 출력 142 t/s (빠른 모드 45 / 71 / 81 / 148).
+**예측 속도 (E5-2690 v4, 64GB, 기본값):** MTP 없이 41 t/s, **QFN 자체 MTP 초안 모델을 실제 가중치로 잰 채택률(71% / 52% / 36%) 기준 61 t/s**, 4060 Ti와 같이 쓰면 56 t/s / MTP 80 t/s. 대화·구조화 출력은 Basalt의 채택률을 빌리면 76 / 142 t/s.
 실제 하드웨어 측정이 아니라 측정한 라우팅으로 계산한 예측입니다.
 
 - 적응형 캐시를 C 엔진 코드(`tcache`)로 구현: 실제 라우팅 기록을 재생해 Python 시뮬레이션과 0.1% 이내로 일치
@@ -311,7 +320,7 @@ reporting set to "OS First" in the BIOS.
 - 호스트 BFP 반올림을 tt-metal과 똑같이 맞춤(동률은 짝수 쪽). 이전에는 동률에서 달라 카드로 옮길 때 값이 미세하게 바뀔 수 있었음.
   호스트 형식 → 카드 타일 변환기(`tt_tile.c`)가 tt-metal 패커와 바이트 단위로 동일함을 확인
 - 디코딩 한 스텝을 numpy로 그대로 적은 기준 구현(`ref.py`): 카드 경로를 구현할 때의 명세. HF와 결과가 같은지 CI에서 확인
-- **실제 360GB 모델 가중치로도 검증**: 48개 층 전부에서 HF와 똑같은 전문가를 고름(100%). QFN 자체 MTP 초안 모델의 1토큰 초안이 본 모델 결과와 61% 일치
+- **실제 360GB 모델 가중치로도 검증**: 160토큰, 48개 층 전부에서 HF와 똑같은 전문가를 고름(100%). QFN 자체 MTP 초안 모델의 연속 초안 채택률 71% / 52% / 36% (스텝당 2.08토큰)
 
 **다음 할 일:** 카드가 오면 TT-NN 카드 경로와 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 
