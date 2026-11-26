@@ -79,8 +79,31 @@ def main():
     print("all ops agree" if not bad else f"{bad} ops to fix in ops.TTNN")
     if not bad:
         bad += card_end_to_end(dev)
+        promotion_cost(dev)
     ttnn.close_device(dev)
     sys.exit(bad > 0)
+
+
+def promotion_cost(dev, I=640, d=2560, n=8):
+    """What the adaptive cache's copies cost: one QFN expert (gate, up, down) into a bank slot, through ops.TTNN's
+    bank_write (from float32: ttnn packs BFP4 on the host). 25 copies per token have to fit next to a ~25 ms token."""
+    import time
+    o = TTNN(dev)
+    rng = np.random.default_rng(0)
+    banks = [o.bank(n, d, I, "bfp4"), o.bank(n, d, I, "bfp4"), o.bank(n, I, d, "bfp4")]
+    ws = [rng.standard_normal((I, d)).astype(np.float32) / 50, rng.standard_normal((I, d)).astype(np.float32) / 50,
+          rng.standard_normal((d, I)).astype(np.float32) / 25]
+    for b, w in zip(banks, ws):                        # warm-up
+        o.bank_write(b, 0, w)
+    t0 = time.perf_counter()
+    for s in range(1, n):
+        for b, w in zip(banks, ws):
+            o.bank_write(b, s, w)
+    import ttnn
+    ttnn.synchronize_device(dev)
+    ms = (time.perf_counter() - t0) / (n - 1) * 1e3
+    print(f"expert copy into a slot: {ms:.1f} ms each -> {25 * ms:.0f} ms for 25 per token "
+          f"({'fine' if 25 * ms < 10 else 'too slow: lower run.py --budget, or upload tstore_expert_tt tiles as is'})")
 
 
 def card_end_to_end(dev, T=24):

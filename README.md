@@ -311,6 +311,13 @@ make -C kernels libtuff_cuda.so && python device/test_cuda_ops.py   # with the 4
 python device/run.py --model /path/to/snapshot --store experts/ --prompt "..." --gpu
 ```
 
+**Open risk: the cache's copies.** The adaptive cache copies up to 25 experts per token into the card's slots. The
+host keeps each expert already in TT's BFP4 tile layout (`tstore_expert_tt`), but ttnn has no public call that takes
+pre-packed BFP tiles: `from_buffer` excludes BFP, and `from_torch` packs from float on the host, which for 25 × 4.9M
+weights per token is likely far too slow. So `TTNN.bank_write` packs from float for now, `test_ops.py` times it on day
+one, and `run.py --budget` lowers the copies per token (10 copies: 76% hits instead of 90% on the prose→code trace) until
+a raw tile write (tt-metal's buffer API, or uint32 words decoded on the card) replaces it.
+
 **The 4060 Ti's backend.** [`ops.CUDA`](device/ops.py) keeps BFP weights as BFP in GPU memory, in the host layout
 that `tstore` maps, and multiplies with [`kernels/bfp_cuda.cu`](kernels/bfp_cuda.cu) (`make -C kernels
 libtuff_cuda.so`, compiled in CI); everything else is torch on CUDA. `device/run.py --gpu` splits the dense part with it

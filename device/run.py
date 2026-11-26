@@ -52,6 +52,30 @@ class Expert:
         return (self.src.expert_bf16(self.name, e).astype(np.uint32) << 16).view(np.float32)
 
 
+def mtp_config(cfg):
+    import copy
+    mc = copy.deepcopy(cfg)
+    mc.num_hidden_layers, mc.layer_types, mc.ple_layer_ids = 1, ["full_attention"], []
+    return mc
+
+
+def build(cfg, W, MW, host, ops, so, n_slots, budget, gpu=None, **kw):
+    """-> (the main model on the card -- with gpu = (its ops, plan.split_multi's split): on the card and the GPU --,
+    QFN's MTP drafter or None). The expert cache is tcache (libtuff `so`)."""
+    import host_c
+    L, E = cfg.num_hidden_layers, cfg.num_experts
+    if gpu:                                            # the 4060 Ti: its share of every head and row, its own slots
+        import tp
+        g, sp = gpu
+        cache = host_c.CCache(sp["n_card"], budget, L, E, so=so, n_other=sp["n_gpu"])
+        card = tp.TP(ops, g, W, cfg, host, f=sp["f"], n_card=sp["n_card"], n_gpu=sp["n_gpu"], cache=cache, **kw)
+    else:
+        card = qfn.Card(ops, W, cfg, host, slots=n_slots, cache=host_c.CCache(n_slots, budget, L, E, so=so), **kw)
+    # ponytail: the MTP layer's experts from the checkpoint into its own slots (256); store them too if it matters
+    drafter = None if MW is None else qfn.MTPDrafter(ops, MW, cfg, qfn.Host(MW, mtp_config(cfg)), slots=256, budget=10, **kw)
+    return card, drafter
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -60,6 +84,7 @@ def main():
     ap.add_argument("--n", type=int, default=128)
     ap.add_argument("--mtp", type=int, default=2, help="drafts per step (0: off)")
     ap.add_argument("--ctx", type=int, default=4096)
+    ap.add_argument("--budget", type=int, default=25, help="expert copies into the slots per step")
     ap.add_argument("--trace-mb", type=int, default=256, help="trace region (raise it if capture says so)")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--gpu", action="store_true", help="split the dense part with an NVIDIA GPU (device/tp.py)")
@@ -74,7 +99,6 @@ def main():
     so = host_c.lib()
     host = host_c.CHost(W, cfg, a.store, "bfp4", so=so)
     mm = plan.memory_map(DENSE, "bfp4", a.ctx, plan.HOSTS["E5-2690v4, 4x16GB"])
-    n_slots, L, E = mm["n_dev"], cfg.num_hidden_layers, cfg.num_experts
     if a.cpu:
         from ops import Torch
         ops = Torch()
@@ -82,24 +106,16 @@ def main():
         import ttnn
         from ops import TTNN
         ops = TTNN(ttnn.open_device(device_id=0, trace_region_size=a.trace_mb << 20))
-    kw = dict(dense_fmt=DENSE, expert_fmt="bfp4", max_t=a.ctx)
-    if a.gpu:                                          # the 4060 Ti: its share of every head and row, its own slots
-        import tp
-        from ops import CUDA
-        sp = plan.split_multi(plan.GPUS["RTX 4060 Ti 16GB"], DENSE, "bfp4", a.ctx)
-        cache = host_c.CCache(sp["n_card"], 25, L, E, so=so, n_other=sp["n_gpu"])
-        card = tp.TP(ops, CUDA(), W, cfg, host, f=sp["f"], n_card=sp["n_card"], n_gpu=sp["n_gpu"], cache=cache, **kw)
-    else:
-        card = qfn.Card(ops, W, cfg, host, slots=n_slots, cache=host_c.CCache(n_slots, 25, L, E, so=so), **kw)
-    drafter = None
+    MW = None
     if a.mtp:
-        import copy
-        mcfg = copy.deepcopy(cfg)
-        mcfg.num_hidden_layers, mcfg.layer_types, mcfg.ple_layer_ids = 1, ["full_attention"], []
-        MW = Weights(src, mcfg, prefix="mtp.")
+        MW = Weights(src, mtp_config(cfg), prefix="mtp.")
         MW.cache["embed_tokens.weight"] = W["embed_tokens.weight"]
-        # ponytail: the MTP layer's experts from the checkpoint into its own slots (256); store them too if it matters
-        drafter = qfn.MTPDrafter(ops, MW, cfg, qfn.Host(MW, mcfg), slots=256, budget=10, **kw)
+    gpu = None
+    if a.gpu:
+        from ops import CUDA
+        gpu = (CUDA(), plan.split_multi(plan.GPUS["RTX 4060 Ti 16GB"], DENSE, "bfp4", a.ctx))
+    card, drafter = build(cfg, W, MW, host, ops, so, mm["n_dev"], a.budget, gpu, dense_fmt=DENSE, expert_fmt="bfp4",
+                          max_t=a.ctx)
 
     ids = tok(a.prompt)["input_ids"]
     t0 = time.perf_counter()
