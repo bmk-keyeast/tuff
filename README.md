@@ -410,9 +410,71 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Prefill on the card: passes of 512 tokens, attention for all of them at once (masked), last DeltaNet state only
 - [ ] Prefill experts: stream them to the card in layer order instead of computing the cold ones on the CPU
 - [ ] N-gram table on NVMe with prefetch
+- [ ] C++ host loop over tt-metal (after the Python version runs on the card): see [Later](#later)
+- [ ] DeepSeek-V3 / R1 on several cards: routing measured first, see [Later](#later)
 - [ ] AVX-512 kernels for the 8259CL, only if `bench/host.sh` shows cold experts compute-bound (on paper AVX2 already
       outruns DRAM on both hosts: ~10 GB/s per core)
 - [ ] OpenAI- and Anthropic-compatible server
+
+## Later
+
+### A C++ host loop
+
+The Python card code is the specification: it is what CI checks against ref.py and transformers, and what goes on the
+card first. The heavy work is already not Python (ttnn ops run on the card, cold experts in `kernels/`), so a port
+buys the host's share of a token, and two things Python cannot do well:
+
+- **Control time.** Per token the host routes 48 layers, asks the cache, builds expert ids and gate weights, and issues
+  ~600 calls (`device/opcount.py`); in Python that is a few ms of a ~28 ms token, in C++ a fraction of one.
+- **The expert copies.** tt-metal's C++ API can write raw bytes into part of a device buffer, so a promoted expert's
+  TT tiles (`tstore_expert_tt`) could go into its bank slot as they are, with no float repacking: the open risk above.
+- **Parallel threads.** A copy thread on a second command queue next to the decode thread (no GIL).
+
+Plan: run and measure the Python version on the card first; then port the decode step (Card.verify/commit, the MoE
+dispatch, the cache) to C++ over tt-metal, with libtuff for the host side, and keep the Python version as its test
+oracle (same tokens, same slot decisions).
+
+### DeepSeek-V3 / R1 on several cards
+
+The same split (dense on the cards, experts cached on the cards, the rest computed by the host CPU) carries over, at a
+larger size:
+
+| | QFN (now) | DeepSeek-V3 |
+|---|---:|---:|
+| routed experts | 24,576 (48 × 512) | 14,848 (58 × 256), 8 active per layer |
+| one expert, BFP4 | 2.8 MB | 24.8 MB |
+| all experts, BFP4 | 68 GB | 368 GB |
+| dense read per token (BFP8) | ~4 GB | ~17 GB (MLA attention, shared experts, 3 dense layers, head) |
+| routed experts per token (BFP4) | ~1.3 GB | ~11.5 GB |
+
+A first estimate in the style of plan.py (32 GB per p150a at 43% of 512 GB/s; host DRAM at 70%; no MTP; ideal
+scaling across cards), tokens/s for host DDR3 4-channel / DDR4-2133 4-channel / DDR4-2933 6-channel:
+
+| p150a cards | experts that fit on them | 50% card hits | 75% | 90% |
+|---:|---:|---|---|---|
+| 1 | 3% | 4 / 5 / 7 | 6 / 7 / 8 | 8 / 8 / 8 |
+| 2 | 12% | 5 / 6 / 10 | 8 / 10 / 14 | 13 / 15 / 15 |
+| 4 | 28% | 5 / 7 / 12 | 10 / 12 / 18 | 17 / 20 / 27 |
+| 8 | 61% | 6 / 7 / 14 | 10 / 13 / 22 | 21 / 25 / 36 |
+
+What it says: the host's bandwidth stops mattering only near 90% card hits, and that needs a large share of the
+experts on the cards (QFN: 40% on one card gave 90%). With one or two cards the CPU computes most experts and its
+bandwidth sets the speed. Each copy is 9× QFN's (~2 ms over PCIe 3.0), so the cache can move only a few experts per
+token. And DeepSeek's routing is trained to spread load evenly, which may leave less reuse between tokens than QFN's.
+
+Steps, cheapest first:
+
+1. **Measure DeepSeek's routing** on GitHub Actions as trace.py did for QFN (stream the checkpoint layer by layer, record
+   each token's experts on prose and code): reuse between tokens, and the hit rate of the adaptive cache at 3–60% of
+   the experts on the cards. This decides the card count before anything is bought.
+2. **plan.py for DeepSeek** with those hit rates: cards, host RAM (≥ 384 GB, better 512 GB: 6-channel 8259CL / Gold
+   6138 with 64 GB modules; DDR3 X99 boards top out at 128–256 GB), PCIe slots and power (~300 W per card).
+3. **ref.py for DeepSeek** (MLA attention, the shared expert, the first dense layers, its MTP module), checked against
+   transformers on a tiny config, then on the real weights for routing agreement.
+4. **Card code**: MLA on the card, the dense part split across the cards (tensor parallel as device/tp.py), each card
+   holding different experts (one cache over all their slots), partial sums over the cards' own links where the
+   p150a's ports allow, else through the host.
+5. **Host**: the same BFP4 store, kernels and cache at DeepSeek's shapes (7168 × 2048 experts).
 
 ## Host notes for the p150a
 
@@ -469,6 +531,8 @@ reporting set to "OS First" in the BIOS.
 - **실행 스크립트**(`device/run.py`): 실제 체크포인트 + ttnn + C 호스트 + MTP를 한 번에 연결. `--gpu`면 4060 Ti와 분할.
   4060 Ti 쪽은 BFP 가중치를 그대로 GPU에 두고 CUDA 커널로 계산(`ops.CUDA`). 카드·GPU가 없어 아직 미실행
 - **카드 첫 실행 검사**(`device/test_ops.py`): 연산 하나하나를 CPU와 비교한 뒤, 카드 코드 전체(trace, MTP 포함)를 CPU 결과와 비교
+
+**향후 계획 (README의 Later):** ① 카드에서 Python 버전을 검증한 뒤 디코딩 루프를 C++로 옮기기(호스트 제어 시간 감소, 전문가 타일을 재포장 없이 바로 쓰기, 복사 전용 스레드). ② DeepSeek-V3/R1을 카드 여러 장으로: 먼저 GitHub Actions에서 DeepSeek의 라우팅을 측정해 캐시 적중률을 확인하고, 그걸로 필요한 카드 수(대략 4~8장)와 호스트 램(384~512GB, 6채널)을 정함.
 
 **다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고, `device/run.py`로 실제 생성·속도 측정(호출당 8µs 가정을 실측으로 교체), 4060 Ti에서 `test_cuda`·`device/test_cuda_ops.py` 실행, 전문가 복사 엔진.
 
