@@ -216,6 +216,15 @@ class Card:
         return o.add(h4, o.reshape(o.mul(o.reshape(inj, (m, self.hc, 1)), o.reshape(out, (m, 1, self.d))),
                                    (m, self.hc * self.d)))
 
+    def conv(self, win, cw, m, step):
+        """Causal depthwise conv of m rows: out[i] = sum_j win[i + j*step] * cw[j], one shifted slice per tap (ops
+        independent of m)"""
+        o, y = self.o, None
+        for j in range(cw.shape[0]):
+            t = o.mul(o.slice(win, 0, j * step, j * step + m), o.slice(cw, 0, j, j + 1))
+            y = t if y is None else o.add(y, t)
+        return y
+
     # ---- Gated DeltaNet: conv window and recurrent state stay on the card
     def deltanet(self, L, x):
         out, win, states = self.deltanet_core(L, x, self.state[L]["conv"], self.state[L]["S"])
@@ -230,7 +239,7 @@ class Card:
         qkv, z, a, b = self.lins(x, [p + ".in_proj_qkv", p + ".in_proj_z", p + ".in_proj_a", p + ".in_proj_b"])
         win = o.concat([conv, qkv], 0)                                                 # [kern - 1 + m, C], oldest first
         cw = self.const(p + ".conv", lambda: np.asarray(self.w[p + ".conv1d.weight"], np.float64)[:, 0, :].T)
-        qkv = o.silu(o.concat([o.sum(o.mul(o.slice(win, 0, i, i + kern), cw), 0) for i in range(m)], 0))
+        qkv = o.silu(self.conv(win, cw, m, 1))
         l2 = lambda t: o.mul(t, o.rsqrt(o.add(o.sum(o.mul(t, t), -1), 1e-6)))
         q = l2(o.reshape(o.slice(qkv, 1, 0, K * dk), (m, K, dk)))
         k = l2(o.reshape(o.slice(qkv, 1, K * dk, 2 * K * dk), (m, K, dk)))
@@ -240,7 +249,7 @@ class Card:
         negA = self.const(p + ".negA", lambda: -np.exp(np.asarray(self.w[p + ".A_log"], np.float64))[None])
         dtb = self.const(p + ".dt_bias", lambda: np.asarray(self.w[p + ".dt_bias"], np.float64)[None])
         g = o.mul(negA, o.softplus(o.add(a, dtb)))
-        out, states = o.gdr(q, k, v, g, beta, S, dk ** -0.5)
+        out, states = o.gdr(q, k, v, g, beta, S, dk ** -0.5, per_token=m <= self.trace)   # long passes keep the last
         gate = o.sigmoid(z) if self.gated_act else o.silu(z)
         out = o.mul(self.rms(out, self.norm(p + ".norm.weight", plus_one=False)), gate)
         return o.linear(o.reshape(out, (m, V * dv)), self.lin(p + ".out_proj")), win, states
@@ -280,6 +289,9 @@ class Card:
         s["idx"] = o.write_rows(s["idx"], t0, key)                                     # raw indexer keys
         s["K"] = o.write_rows(s["K"], t0, k)
         s["V"] = o.write_rows(s["V"], t0, vv)
+        if m > self.trace:                             # a long pass (prefill): every token at once, masked
+            out = self.attention_all(L, iq, q, t0, m)
+            return [out] if raw else self.attn_out(L, gate, [out])
         G, outs = H // KV, []
         n_max = c.indexer_budget // ratio * ratio + ratio - 1          # chosen blocks + the open block
 
@@ -309,6 +321,39 @@ class Card:
             mask = o.put(np.where(np.arange(n_max) < n, 0.0, -1e9)[None, None])
             outs.append(self.seg((L, "attend", i), attend, o.slice(q, 0, i, i + 1), ids, mask, m=m)[0])
         return outs if raw else self.attn_out(L, gate, outs)
+
+    def attention_all(self, L, iq, q, t0, m):
+        """Attention for a long pass in a fixed number of ops: the blocks that complete in it pooled at once, every
+        token's block scores in one read, the host's choice sent back as an additive mask [m, t0+m], all heads in one
+        batched matmul. Same rows as the per-token path, so the same result (padding and masked rows add exact 0)."""
+        o, c, s, p = self.o, self.c, self.state[L], f"layers.{L}.self_attn"
+        H, KV, hd = c.num_attention_heads, c.num_key_value_heads, c.head_dim
+        nh, ihd, ratio = c.indexer_n_heads, c.indexer_head_dim, c.indexer_compress_ratio
+        G, T = H // KV, t0 + m
+        b0, b1 = (t0 + ratio) // ratio - 1, T // ratio           # blocks completing in this pass: b0 .. b1-1
+        if b1 > b0:
+            blk = o.reshape(o.mean(o.reshape(o.slice(s["idx"], 0, b0 * ratio, b1 * ratio), (b1 - b0, ratio, ihd)), 1),
+                            (b1 - b0, ihd))
+            self.cs(0)                                 # the cos / sin tables
+            pos = o.put_ids([b * ratio + self.pos0 for b in range(b0, b1)], "uint32")
+            cos, sin = o.gather_rows(self.dev["cos"], pos), o.gather_rows(self.dev["sin"], pos)
+            s["blk"] = o.write_rows(s["blk"], b0, self.rope(self.rms(blk, self.norm(p + ".indexer.k_layernorm.weight")), cos, sin))
+        mask = np.full((m, T), -1e9)
+        sc = o.get(o.sum(o.relu(o.matmul(iq, o.transpose(o.slice(s["blk"], 0, 0, b1)))), 1))[:, 0] if b1 else None
+        for i in range(m):                             # sc [m, b1]: token i's score of each complete block
+            t = t0 + i
+            nb = (t + 1) // ratio
+            keep = list(range(nb * ratio, t + 1))
+            if nb:
+                top = np.argsort(-sc[i, :nb], kind="stable")[:min(c.indexer_budget // ratio, nb)]
+                keep += [int(j) * ratio + r for j in top for r in range(ratio)]
+            mask[i, keep] = 0.0
+        Q = o.reshape(o.permute(o.reshape(q, (m, KV, G, hd)), (1, 2, 0, 3)), (KV, G * m, hd))
+        K = o.permute(o.reshape(o.slice(s["K"], 0, 0, T), (T, KV, hd)), (1, 2, 0))      # [KV, hd, T]
+        V = o.permute(o.reshape(o.slice(s["V"], 0, 0, T), (T, KV, hd)), (1, 0, 2))      # [KV, T, hd]
+        a = o.softmax(o.add(o.reshape(o.matmul(Q, K), (KV, G, m, T)), o.put(mask)))
+        y = o.matmul(o.reshape(a, (KV, G * m, T)), V)                                  # [KV, G*m, hd]
+        return o.reshape(o.permute(o.reshape(y, (KV, G, m, hd)), (2, 0, 1, 3)), (m, H * hd))
 
     def attn_out(self, L, gate, outs):
         return self.o.linear(self.o.mul(self.o.concat(outs, 0), gate), self.lin(f"layers.{L}.self_attn.o_proj"))
@@ -410,13 +455,11 @@ class Card:
         gvn = o.reshape(self.rms(gv, self.norm(p + ".norm_conv.weight", rows=hc)), (m, hc * d))
         win = o.concat([st, gvn], 0)                                                   # last 9 + the m new
         cw = self.const(p + ".conv", lambda: np.asarray(self.w[p + ".conv1d.weight"], np.float64)[:, 0, :].T)
-        span = (c.ple_conv_kernel_size - 1) * c.ngram_size
-        conv = [o.sum(o.mul(o.concat([o.slice(win, 0, j, j + 1) for j in range(i, i + span + 1, c.ngram_size)], 0), cw), 0)
-                for i in range(m)]
-        return o.add(h4, o.add(o.reshape(gv, (m, hc * d)), o.silu(o.concat(conv, 0)))), win
+        return o.add(h4, o.add(o.reshape(gv, (m, hc * d)), o.silu(self.conv(win, cw, m, c.ngram_size)))), win
 
     # ---- m tokens through the model, then keep j of them
     pos0 = 0                                           # RoPE position of cache row 0 (the MTP layer starts at 1)
+    prefill_chunk = 512
 
     def layers(self, h4, tokens=()):
         """h4 [m, hc*d] residual rows of m consecutive positions starting at self.t -> after the last layer."""
@@ -484,7 +527,9 @@ class Card:
             if L in self.pending:
                 p, kern = self.pending[L], c.linear_conv_kernel_dim
                 s["conv"] = o.slice(p["win"], 0, j, j + kern - 1)
-                s["S"] = o.reshape(o.slice(p["states"], 0, j - 1, j), tuple(p["states"].shape[1:]))
+                n = p["states"].shape[0]               # m per-token states, or 1: a long pass, kept whole
+                assert n > 1 or j == p["win"].shape[0] - (kern - 1) or j == 1, "a long pass keeps only its last state"
+                s["S"] = o.reshape(o.slice(p["states"], 0, min(j, n) - 1, min(j, n)), tuple(p["states"].shape[1:]))
             if (L, "ple") in self.pending:
                 s["ple"] = o.slice(self.pending[L, "ple"], 0, j, j + (c.ple_conv_kernel_size - 1) * c.ngram_size)
         self.tokens += self.verified[:j]
@@ -501,11 +546,15 @@ class Card:
 
     def generate(self, prompt, n, drafter=None, k=2):
         """Greedy decoding of n tokens after the prompt; with a drafter, speculative: each step verifies the last
-        token plus k drafts and keeps the drafts up to the first one the model disagrees with."""
-        nxt = int(self.lm_argmax(self.verify(prompt))[-1])
-        self.commit(len(prompt))
-        if drafter:
-            drafter.catch_up(self, 0, len(prompt))
+        token plus k drafts and keeps the drafts up to the first one the model disagrees with. The prompt goes in
+        passes of up to prefill_chunk tokens (attention's mask is [m, t])."""
+        for i in range(0, len(prompt), self.prefill_chunk):
+            chunk = prompt[i:i + self.prefill_chunk]
+            mixed = self.verify(chunk)
+            self.commit(len(chunk))
+            if drafter:
+                drafter.catch_up(self, i, len(chunk))
+        nxt = int(self.lm_argmax(mixed)[-1])
         out, self.steps = [], 0
         while len(out) < n:
             drafts = drafter.propose(self, nxt, k) if drafter else []

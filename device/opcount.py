@@ -106,7 +106,7 @@ def table(m):
     return "\n".join(out)
 
 if __name__ == "__main__":
-    text = "\n\n".join(table(m) for m in (1, 3))
+    text = "\n\n".join(table(m) for m in (1, 3, 24))   # a decode step, an MTP verify, a prefill pass
     print(text)
     if "--md" in sys.argv:
         Path(sys.argv[sys.argv.index("--md") + 1]).write_text(

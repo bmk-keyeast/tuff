@@ -161,3 +161,4 @@ class TP:
         return np.where(vb > va, ib[:, 0] + self.v_gpu, ia[:, 0])
 
     generate = qfn.Card.generate
+    prefill_chunk = qfn.Card.prefill_chunk

@@ -174,11 +174,27 @@ def main(T=40):
     print(f"verify(m tokens) + commit == single steps: max relative error {err:.1e}")
     assert err < 1e-4, err
 
+    # 2b. a long pass (prefill: attention for all tokens at once, eager) then single steps == ref.py
+    pre = qfn.Card(Torch(), w, c, qfn.Host(w, c), dense_fmt="f32", expert_fmt="f32", slots=n_slots, budget=4)
+    got = []
+    for a, b in ((0, 12), (12, 27)):                   # two long passes: the second starts mid-block, at t = 12
+        got.append(pre.o.get(pre.verify(ids[a:b])))
+        pre.commit(b - a)
+    for t in ids[27:]:
+        got.append(pre.o.get(pre.step(int(t))))
+    got = np.concatenate(got)
+    err = (np.abs(got - want).max(1) / np.abs(want).max(1)).max()
+    print(f"prefill (12 + 15 tokens in two passes) + single steps == ref.py: max relative error {err:.1e}")
+    assert err < 1e-4, err
+
     # 3. speculative == plain greedy
     prompt, n = list(ids[:12]), 24
     mk = lambda: qfn.Card(Torch(), w, c, qfn.Host(w, c), dense_fmt="f32", expert_fmt="f32", slots=n_slots, budget=4)
     plain = mk()
     truth = plain.generate(prompt, n)
+    chunked = mk()
+    chunked.prefill_chunk = 5                          # prompt in passes of 5, 5, 2 (traced, short passes)
+    assert chunked.generate(prompt, n) == truth
     for name, drafter, k in (("oracle drafter, 3 drafts", Oracle(truth, len(prompt), c.vocab_size), 3),
                              ("QFN MTP drafter, 2 drafts", qfn.MTPDrafter(Torch(), mtp_weights(c), c, qfn.Host(w, c),
                                                                          dense_fmt="f32", expert_fmt="f32"), 2)):
@@ -187,6 +203,12 @@ def main(T=40):
         print(f"speculative greedy ({name}) == plain greedy: {out == truth}, {n} tokens in {card.steps} steps "
               f"(plain: {plain.steps})")
         assert out == truth
+    card = mk()
+    card.prefill_chunk = 5                             # the MTP drafter catching up chunk by chunk
+    out = card.generate(prompt, n, qfn.MTPDrafter(Torch(), mtp_weights(c), c, qfn.Host(w, c), dense_fmt="f32",
+                                                  expert_fmt="f32"), 2)
+    print(f"speculative greedy (MTP drafter, prompt in passes of 5) == plain greedy: {out == truth}")
+    assert out == truth
 
     tuff = qfn.Card(Torch(), w, c, qfn.Host(w, c), dense_fmt={"lm_head": "bfp4", "lin_z": "bfp4"}, expert_fmt="bfp4",
                     slots=n_slots, budget=4)

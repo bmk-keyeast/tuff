@@ -290,6 +290,13 @@ The TTNN side of this is written from the ttnn docs and not run: `sparse_matmul`
 bfp4 banks, `embedding` for row gathers, `update_cache` for row writes, `begin/end_trace_capture` + `execute_trace`.
 `device/test_ops.py` checks each against the CPU backend first thing on the card.
 
+**Prefill.** The prompt goes in passes of up to 512 tokens. A long pass is eager (no trace) but its op count no
+longer grows with its length: the causal convs are one shifted slice per tap, and attention scores every token's
+blocks in one read, gets the host's choice back as an additive mask [m, t], and attends with all heads in one batched
+matmul ([`attention_all`](device/qfn.py)). DeltaNet keeps only the last state of a long pass (per-token states, needed
+to roll back a speculative verify, would take m × 3 MiB per layer). `test_qfn.py` checks a prompt in two long passes
+(the second starting mid-block) and prompts chunked under a drafter against ref.py / plain greedy.
+
 Not there yet: a CUDA backend for ops.py (the GPU side runs on the
 Torch backend; with torch on CUDA it is the same code).
 
@@ -371,7 +378,8 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] QFN's MTP drafter in the reference, on the real weights: chained drafts accepted 71% / 52% / 36%, 2.08 tokens per step
 - [x] MTP speculative decoding in the card code: verify + rollback, QFN's drafter, == plain greedy (CPU backend)
 - [x] Card dispatches per pass: 10,297 → 604 ops (fused linears, expert banks + sparse matmul, traced segments), counted by `device/opcount.py`
-- [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
+- [x] Prefill on the card: passes of 512 tokens, attention for all of them at once (masked), last DeltaNet state only
+- [ ] Prefill experts: stream them to the card in layer order instead of computing the cold ones on the CPU
 - [ ] N-gram table on NVMe with prefetch
 - [ ] AVX-512 kernels for the 8259CL, only if `bench/host.sh` shows cold experts compute-bound (on paper AVX2 already
       outruns DRAM on both hosts: ~10 GB/s per core)
@@ -425,6 +433,8 @@ reporting set to "OS First" in the BIOS.
 - **카드 연산 수 줄이기**(`device/opcount.py`): 같은 입력을 읽는 가중치를 하나의 linear로 합치고, RMSNorm·RoPE를 한 연산으로,
   슬롯 전문가는 층마다 묶음 matmul 3번(sparse_matmul), 패스 전체를 trace 구간의 연결로 바꿈. 토큰 1개 패스의 카드 연산이
   10,297 → 604개, 호스트가 기다리는 읽기는 층마다 라우팅 1번 + 어텐션 블록 선택뿐. 결과·양자화 오차는 그대로
+- **프롬프트 처리(prefill)**: 512토큰씩 한 번에. 어텐션은 마스크로 모든 토큰을 한 번에 계산하고, DeltaNet은 마지막 상태만
+  남겨 메모리를 아낌(토큰별 상태는 512토큰이면 층마다 1.5GB). 결과가 ref.py와 같음을 확인
 
 **다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 

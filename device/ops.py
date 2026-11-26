@@ -154,11 +154,12 @@ class Torch:
         table[i:i + rows.shape[0]] = rows
         return table
 
-    def gdr(self, q, k, v, g, beta, state, scale):
+    def gdr(self, q, k, v, g, beta, state, scale, per_token=True):
         """The gated delta rule over m tokens (ttnn.transformer.fused_recurrent_gated_delta_rule, T = m): q, k [m, H, K]
         (already L2-normed), v [m, HV, V], g, beta [m, HV], state [HV, K, V]; key head i serves value heads
         i*HV/H ... Returns (o [m, HV, V], the state after each token [m, HV, K, V]) -- per-token states let an MTP
-        verification keep exactly the accepted tokens."""
+        verification keep exactly the accepted tokens; per_token=False returns only the last one, [1, HV, K, V] (a long
+        prefill pass: per-token states would take m x 3 MiB per layer on QFN)."""
         G = v.shape[1] // q.shape[1]
         q, k = q.repeat_interleave(G, 1) * scale, k.repeat_interleave(G, 1)
         S, outs, states = state, [], []
@@ -168,7 +169,7 @@ class Torch:
             S = S + k[i][:, :, None] * delta[:, None, :]
             outs.append(self.t.einsum("hkv,hk->hv", S, q[i]))
             states.append(S)
-        return self.t.stack(outs), self.t.stack(states)
+        return self.t.stack(outs), self.t.stack(states if per_token else [S])
 
 
 class TTNN:
@@ -306,12 +307,12 @@ class TTNN:
         tt.execute_trace(self.dev, tid, cq_id=0, blocking=False)
         return outs
 
-    def gdr(self, q, k, v, g, beta, state, scale):
+    def gdr(self, q, k, v, g, beta, state, scale, per_token=True):
         tt = self.ttnn
         m, H, K = q.shape
         HV, V = v.shape[-2], v.shape[-1]
         o, s = tt.transformer.fused_recurrent_gated_delta_rule(
             tt.reshape(q, (1, m, H, K)), tt.reshape(k, (1, m, H, K)), tt.reshape(v, (1, m, HV, V)),
             tt.reshape(g, (1, m, HV)), tt.reshape(beta, (1, m, HV)), scale=scale,
-            initial_state=tt.reshape(state, (1, HV, K, V)), output_per_token_state=True)
-        return tt.reshape(o, (m, HV, V)), tt.reshape(s, (m, HV, K, V))
+            initial_state=tt.reshape(state, (1, HV, K, V)), output_per_token_state=per_token)
+        return tt.reshape(o, (m, HV, V)), tt.reshape(s, (m if per_token else 1, HV, K, V))
