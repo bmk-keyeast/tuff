@@ -251,7 +251,16 @@ tcache. [`device/test_host_c.py`](device/test_host_c.py) (CI) checks that it giv
 the same BFP4 numbers (1.4e-6), the same slot decisions (349 of 1,280 lookups hit, in both), and that speculative greedy
 decoding over it equals plain greedy decoding over it.
 
-Not there yet: fused ops and traces for speed on the card, and the 4060 Ti's half of the split.
+**The card and a 4060 Ti together.** [`device/tp.py`](device/tp.py) runs the same decode on two devices: DeltaNet split
+by key-head groups, attention by KV head (the indexer on both), the shared expert and the LM head by rows, at any GPU
+share; the replicated parts (hyper-connections, PLE, router) run on the card and the GPU gets the block input as a
+vector; the two partial sums meet in host memory once per block. One expert cache covers both devices' slots (slots
+0 .. n_card-1 on the card, the rest on the GPU). [`device/test_tp.py`](device/test_tp.py) (CI) checks that an even and
+an uneven split (3:1 DeltaNet key heads) give the same outputs as one device (1.6e-6), the same routing and the same
+slot decisions, and that speculative greedy decoding on the two devices equals plain greedy decoding on one.
+
+Not there yet: fused ops and traces for speed on the card, and a CUDA backend for ops.py (the GPU side runs on the
+Torch backend; with torch on CUDA it is the same code).
 
 ## What exists
 
@@ -267,6 +276,7 @@ Not there yet: fused ops and traces for speed on the card, and the 4060 Ti's hal
 | [`tp_check.py`](tp_check.py) | The card/GPU tensor-parallel split is exact, on transformers' Qwen4Exp layer code |
 | [`ref.py`](ref.py) | QFN decode as a per-token recurrence in plain numpy, keyed by checkpoint names: DeltaNet conv window and state, KV cache with the QSA indexer, PLE n-gram hashing and dilated conv, hyper-connections, MoE. The spec for the device path; CI checks it against transformers' prefill on a tiny random model |
 | [`device/`](device) | The card code: `qfn.py` (decode and MTP verification, card/host split, expert slots, MTP drafter), `ops.py` (Torch and ttnn backends), `host_c.py` (the C host side via ctypes), `test_qfn.py` (== ref.py, speculative == greedy), `test_host_c.py` (C host == numpy host), `test_ops.py` (ttnn vs Torch, per operation, on the card) |
+| [`device/tp.py`](device/tp.py) | The p150a and a 4060 Ti together: the dense part split (tensor parallel), one expert cache over both devices' slots, partial sums through the host; `test_tp.py` checks it against one device |
 | [`kernels/capi.c`](kernels/capi.c) | `libtuff.so`: tstore, tcache and `moe_forward_n` behind a small C API for the card code |
 | [`ref_real.py`](ref_real.py) | ref.py on the real checkpoint, streamed: routing vs transformers in all 48 layers, next-token loss, QFN's MTP draft acceptance → [`results/ref_real.md`](results/ref_real.md) |
 | [`kernels/tt_tile.c`](kernels/tt_tile.c) | Host panels → Tenstorrent `bfp4_b`/`bfp8_b` tiles of W^T (8×8 nibble transposes + byte table, 1.1 GB/s per core); CI compares it with a port of tt-metal's `pack_as_bfp_tiles` |
@@ -321,6 +331,7 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Host packing identical to tt-metal's; host → card tile conversion checked against tt-metal's packer
 - [x] Decode recurrence specified in numpy (`ref.py`), checked against transformers and on the real weights (100% routing)
 - [x] The card code runs over the C host side (libtuff.so: tstore + moe_forward_n, tcache), == the numpy host
+- [x] Card + 4060 Ti split in the card code (tensor parallel, shared expert cache), == one device
 - [ ] Copy engine: background PCIe copies of promoted experts to the card and the GPU (pinned host memory)
 - [ ] Run `test_cuda` and `bench/host.sh` on the real box; replace GPU_EFF, CPU_EFF and the round-trip guesses
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
@@ -377,6 +388,8 @@ reporting set to "OS First" in the BIOS.
   QFN MTP 초안 모델도 카드 코드로 작성. 추측 디코딩 결과가 일반 greedy 생성과 토큰 단위로 완전히 같음을 확인
 - **호스트 쪽을 C로 연결**(`libtuff.so`): 놓친 전문가는 변환된 BFP4 파일을 mmap한 저장소에서 `moe_forward_n`으로 한 번에 계산,
   카드 슬롯은 C 캐시(`tcache`)가 관리. numpy 호스트와 결과·슬롯 판단이 같음을 CI에서 확인
+- **카드 + 4060 Ti 분할 실행**(`device/tp.py`): dense 연산을 헤드·행 단위로 두 장치에 나누고 부분합은 호스트에서 합침.
+  전문가 슬롯은 두 장치를 하나의 캐시로 관리. 한 장치로 돌린 결과와 같고(1.6e-6), 추측 디코딩도 일반 greedy와 같음을 확인
 
 **다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 

@@ -79,21 +79,21 @@ class CHost(qfn.Host):
 class CCache:
     """tcache behind qfn.Card's cache interface: keys (layer, expert) <-> global ids layer * E + expert."""
 
-    def __init__(self, n_slots, budget, n_layers, n_experts, so=None):
+    def __init__(self, n_slots, budget, n_layers, n_experts, so=None, n_other=0):
         self.L, self.E, self.budget = so or lib(), n_experts, budget
-        self.c = self.L.tuff_cache_new(n_layers * n_experts, n_slots, 0, budget)
+        self.c = self.L.tuff_cache_new(n_layers * n_experts, n_slots, n_other, budget)
 
     def lookup(self, keys):
         ids = np.array([L * self.E + e for L, e in keys], np.int32)
         slots = np.empty(len(ids), np.int32)
         self.L.tuff_cache_lookup(self.c, ids, len(ids), slots)
-        return [bool(s >= 0) for s in slots]
+        return [int(s) for s in slots]
 
     def end_step(self):
         out = np.empty(3 * (self.budget + 1), np.int32)
         n = self.L.tuff_cache_end(self.c, out)
         key = lambda i: (int(i) // self.E, int(i) % self.E)
-        return [(key(out[3 * i]), None if out[3 * i + 2] < 0 else key(out[3 * i + 2])) for i in range(n)]
+        return [(key(out[3 * i]), None if out[3 * i + 2] < 0 else key(out[3 * i + 2]), int(out[3 * i + 1])) for i in range(n)]
 
     def __del__(self):
         if getattr(self, "c", None):

@@ -60,30 +60,35 @@ class Host:
 
 
 class PyCache:
-    """The adaptive cache's policy in Python (the engine's is C: tcache, same policy): which experts sit in the card's
-    slots; after each step up to `budget` of the step's misses (lowest (layer, expert) first) are copied in, evicting
-    the least recently used."""
+    """The adaptive cache's policy in Python (the engine's is C: tcache, same policy and slot numbers): which experts
+    sit in the accelerators' slots; after each step up to `budget` of the step's misses (lowest (layer, expert) first)
+    are copied in, evicting the least recently used. Empty slots go first, highest number first, as in tcache."""
 
     def __init__(self, n_slots, budget):
-        self.n, self.budget, self.lru, self.missed = n_slots, budget, OrderedDict(), []
+        self.n, self.budget, self.lru, self.missed, self.free = n_slots, budget, OrderedDict(), [], list(range(n_slots))
 
     def lookup(self, keys):
-        hit = []
+        """-> slot of each key, or -1 (a miss: computed on the host)"""
+        out = []
         for k in keys:
-            hit.append(k in self.lru)
-            if hit[-1]:
+            if k in self.lru:
                 self.lru.move_to_end(k)
+                out.append(self.lru[k])
             else:
                 self.missed.append(k)
-        return hit
+                out.append(-1)
+        return out
 
     def end_step(self):
-        """-> [(expert to copy in, expert evicted or None)]"""
+        """-> [(expert to copy in, expert evicted or None, slot)]"""
         out = []
         for key in sorted(set(self.missed))[:self.budget]:
-            ev = self.lru.popitem(last=False)[0] if len(self.lru) >= self.n else None
-            self.lru[key] = True
-            out.append((key, ev))
+            if self.free:
+                ev, slot = None, self.free.pop()
+            else:
+                ev, slot = self.lru.popitem(last=False)
+            self.lru[key] = slot
+            out.append((key, ev, slot))
         self.missed = []
         return out
 
@@ -252,38 +257,51 @@ class Card:
         return self.o.put_weight(gu, self.expert_fmt), self.o.put_weight(dn, self.expert_fmt)
 
     def moe(self, L, x):
-        o, c, p = self.o, self.c, f"layers.{L}.mlp"
-        m, I, E = x.shape[0], c.moe_intermediate_size, c.num_experts
-        vals, top = o.topk(o.softmax(o.linear(x, self.lin(p + ".gate"))), c.num_experts_per_tok)
-        wts = o.get(vals)
-        wts = wts / wts.sum(1, keepdims=True) if c.norm_topk_prob else wts
-        gate = np.zeros((m, E))                                  # gate[i, e]: token i's weight on expert e
-        for i in range(m):
-            gate[i, top[i]] = wts[i]
-            self.routes[L, self.t + i] = top[i]
-        y = o.mul(o.linear(o.mul(o.silu(o.linear(x, self.lin(p + ".shared_expert.gate_proj"))),
-                                 o.linear(x, self.lin(p + ".shared_expert.up_proj"))), self.lin(p + ".shared_expert.down_proj")),
-                  o.sigmoid(o.linear(x, self.lin(p + ".shared_expert_gate"))))
+        o = self.o
+        top, gate = self.route(L, x)                    # gate[i, e]: token i's weight on expert e
+        y = self.shared(L, x)
         es = sorted(set(top.ravel().tolist()))
         cold = []
-        for e, hit in zip(es, self.cache.lookup([(L, e) for e in es])):
+        for e, slot in zip(es, self.cache.lookup([(L, e) for e in es])):
             n = int((gate[:, e] > 0).sum())
             self.lookups += n
-            if hit:
+            if slot >= 0:
                 self.hits += n
-                gu, dn = self.slots[L, e]
-                h = o.linear(x, gu)
-                ye = o.linear(o.mul(o.silu(o.slice(h, 1, 0, I)), o.slice(h, 1, I, 2 * I)), dn)
-                y = o.add(y, o.mul(ye, o.put(gate[:, e:e + 1])))
+                y = o.add(y, self.expert(x, *self.slots[L, e], gate[:, e:e + 1]))
             else:
                 cold.append(e)
         if cold:                                          # the only vectors that cross the bus: X out, the sum back
             y = o.add(y, o.put(self.host.experts(L, o.get(x), cold, gate[:, cold].T)))
         return y
 
+    def route(self, L, x):
+        """Router on this device: -> (top [m, k] experts, gate [m, E] weights) on the host."""
+        o, c = self.o, self.c
+        vals, top = o.topk(o.softmax(o.linear(x, self.lin(f"layers.{L}.mlp.gate"))), c.num_experts_per_tok)
+        wts = o.get(vals)
+        wts = wts / wts.sum(1, keepdims=True) if c.norm_topk_prob else wts
+        gate = np.zeros((x.shape[0], c.num_experts))
+        for i in range(x.shape[0]):
+            gate[i, top[i]] = wts[i]
+            self.routes[L, self.t + i] = top[i]
+        return top, gate
+
+    def shared(self, L, x):
+        """The gated shared expert (this device's rows of it, when the dense part is split)."""
+        o, p = self.o, f"layers.{L}.mlp"
+        return o.mul(o.linear(o.mul(o.silu(o.linear(x, self.lin(p + ".shared_expert.gate_proj"))),
+                                    o.linear(x, self.lin(p + ".shared_expert.up_proj"))), self.lin(p + ".shared_expert.down_proj")),
+                     o.sigmoid(o.linear(x, self.lin(p + ".shared_expert_gate"))))
+
+    def expert(self, x, gu, dn, gcol):
+        """A routed expert on every row of x, scaled per row by gcol [m, 1] (0: that token does not use it)."""
+        o, I = self.o, self.c.moe_intermediate_size
+        h = o.linear(x, gu)
+        return o.mul(o.linear(o.mul(o.silu(o.slice(h, 1, 0, I)), o.slice(h, 1, I, 2 * I)), dn), o.put(gcol))
+
     def promote(self):
         """After a step: the cache's copies into the card's slots."""
-        for (L, e), ev in self.cache.end_step():
+        for (L, e), ev, _ in self.cache.end_step():
             self.slots.pop(ev, None)
             self.slots[L, e] = self.upload(L, e)
 

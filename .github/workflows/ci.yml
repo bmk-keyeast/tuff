@@ -61,4 +61,5 @@ jobs:
       - run: python tp_check.py
       - run: python ref.py      # numpy decode recurrence == transformers' prefill, every token
       - run: python device/test_qfn.py   # the card code on ops.Torch == ref.py, token by token
+      - run: python device/test_tp.py    # card + GPU split == one device; speculative == greedy on it
       - run: make -C kernels libtuff.so && python device/test_host_c.py   # ... over the C host side == over numpy
