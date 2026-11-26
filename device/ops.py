@@ -118,6 +118,27 @@ class Torch:
     def slice(self, a, dim, start, end): return a.narrow(dim, start, end - start)
     def concat(self, xs, dim): return self.t.cat(xs, dim)
     def transpose(self, a): return a.transpose(-2, -1)
+    def permute(self, a, dims): return a.permute(*dims)
+
+    def put_ids(self, ids, dtype="uint32"):
+        """row ids on the card (uint32 for gather_rows, uint16 for gather_matmul)"""
+        self._host()
+        return self.t.as_tensor(np.asarray(ids, np.int64))
+
+    def bank(self, n, k, N, fmt):
+        """n weight slots of W^T [k, N] in fmt. ponytail: a dict of the filled slots here; one [n, k, N] tensor on the
+        card"""
+        return dict(w={}, fmt=fmt)
+
+    def bank_write(self, bank, slot, w):
+        """W [N, k] (torch layout) into a slot"""
+        bank["w"][int(slot)] = self.put_weight(w, bank["fmt"])
+
+    def gather_matmul(self, x, bank, ids, act=None):
+        """x [1 or n, m, k] @ bank[ids[i]] for each of the n ids -> [n, m, N], act fused (ttnn.sparse_matmul in
+        indexed mode: only those slots' weights are read)"""
+        y = x @ self.t.stack([bank["w"][int(i)] for i in ids])
+        return y if act is None else getattr(self, act)(y)
 
     def topk(self, a, k):
         """k largest of each row of a [m, n], ties to the lowest index (as ttnn.topk(stable=True)); returns (values
@@ -127,11 +148,9 @@ class Torch:
         return self.t.gather(a, 1, self.t.from_numpy(idx)), idx
 
     def gather_rows(self, table, idx):
-        self._host()
         return table[self.t.as_tensor(np.asarray(idx, np.int64))]
 
     def write_rows(self, table, i, rows):
-        self._host()
         table[i:i + rows.shape[0]] = rows
         return table
 
@@ -215,21 +234,58 @@ class TTNN:
 
     def concat(self, xs, dim): return self.ttnn.concat(xs, dim=dim)
     def transpose(self, a): return self.ttnn.transpose(a, -2, -1)
+    def permute(self, a, dims): return self.ttnn.permute(a, tuple(dims))
+
+    def put_ids(self, ids, dtype="uint32"):
+        tt = self.ttnn
+        a = self.t.tensor(np.asarray(ids, np.int64).reshape(1, -1), dtype=self.t.int32)
+        return tt.from_torch(a, dtype=getattr(tt, dtype), layout=tt.ROW_MAJOR_LAYOUT, device=self.dev)
+
+    def bank(self, n, k, N, fmt):
+        tt = self.ttnn
+        return dict(w=tt.zeros((n, 1, k, N), dtype=self.dt[fmt], layout=tt.TILE_LAYOUT, device=self.dev),
+                    sp=tt.zeros((1, 1, 1, n), dtype=tt.bfloat16, layout=tt.ROW_MAJOR_LAYOUT, device=self.dev),
+                    n=n, k=k, N=N, fmt=fmt)                     # sp: sparse_matmul's operand, unread in indexed mode
+
+    def bank_write(self, bank, slot, w):
+        # ponytail: fill_cache's [batch, heads, seq, dim] in-place write, one slot = one batch row; whether it takes
+        # bfp4/bfp8 caches is not in its docs -- test_ops.py checks; else copy tiles with a device-side write
+        k, N = bank["k"], bank["N"]
+        self.ttnn.fill_cache(bank["w"], self.ttnn.reshape(self.put_weight(w, bank["fmt"]), (1, 1, k, N)), batch_idx=int(slot))
+
+    def gather_matmul(self, x, bank, ids, act=None):
+        # ponytail: indexed sparse_matmul from its docs (no example there); the program config is untuned
+        tt = self.ttnn
+        g, m, k = x.shape
+        n, N = ids.shape[-1], bank["N"]
+        grid = self.dev.compute_with_storage_grid_size()
+        nt = -(-N // 32)
+        cores = min(grid.x * grid.y, nt)
+        pc = tt.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+            compute_with_storage_grid_size=grid, in0_block_w=1, out_subblock_h=1, out_subblock_w=1,
+            per_core_M=-(-m // 32), per_core_N=-(-nt // cores), fuse_batch=False, fused_activation=None, mcast_in0=True)
+        y = tt.sparse_matmul(tt.reshape(x, (1, g, m, k)), tt.reshape(bank["w"], (1, bank["n"], k, N)), sparsity=bank["sp"],
+                             indices=ids, is_input_a_sparse=g > 1, program_config=pc)
+        y = tt.reshape(y, (n, m, N))
+        return y if act is None else getattr(self, act)(y)
 
     def topk(self, a, k):
         vals, idx = self.ttnn.topk(a, k, dim=-1, largest=True, sorted=True, stable=True)
         return vals, self.ttnn.to_torch(idx).numpy().reshape(a.shape[0], -1)[:, :k].astype(np.int64)
 
-    def gather_rows(self, table, idx):
-        # ponytail: through the host; ttnn.embedding (row-major table) once the KV cache layout is settled
-        return self.put(self.get(table)[np.asarray(idx, np.int64)])
+    def gather_rows(self, table, ids):
+        """table rows ids (put_ids, uint32) -> [n, D]"""
+        y = self.ttnn.embedding(ids, table, layout=self.ttnn.TILE_LAYOUT)
+        return self.ttnn.reshape(y, (ids.shape[-1], table.shape[-1]))
 
     def write_rows(self, table, i, rows):
-        # ponytail: through the host; ttnn.update_cache on a [1, 1, S, D] cache is the on-card version
-        t = self.get(table)
-        r = self.get(rows)
-        t[i:i + r.shape[0]] = r
-        return self.put(t)
+        """rows [r, D] into table [S, D] at rows i.., in place (ttnn.update_cache, one row per call)"""
+        tt = self.ttnn
+        S, D = table.shape
+        cache = tt.reshape(table, (1, 1, S, D))
+        for r in range(rows.shape[0]):
+            tt.update_cache(cache, tt.reshape(self.slice(rows, 0, r, r + 1), (1, 1, 1, D)), i + r)
+        return table
 
     def trace(self, key, fn, *args):
         """Metal trace: the first call runs fn eagerly (compiles its programs, uploads lazy constants), then captures

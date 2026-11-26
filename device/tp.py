@@ -73,11 +73,11 @@ class TP:
                  **fmt):
         pa, pb = split_parts(cfg, f)
         (wa, ca, _), (wb, cb, self.v_gpu) = shard(w, cfg, pa), shard(w, cfg, pb)
-        self.A = qfn.Card(ops_card, wa, ca, host, **fmt)
-        self.B = qfn.Card(ops_gpu, wb, cb, host, **fmt)
+        self.A = qfn.Card(ops_card, wa, ca, host, slots=n_card, **fmt)
+        self.B = qfn.Card(ops_gpu, wb, cb, host, slots=n_gpu, **fmt)
         self.o, self.w, self.c, self.host = ops_card, w, cfg, host
         self.cache, self.n_card = cache or qfn.PyCache(n_card + n_gpu, budget), n_card
-        self.slots = {}                                  # (layer, expert) -> (device, its weights there)
+        self.slots = {}                                  # (layer, expert) -> (device, its slot there)
         self.hits = self.lookups = 0
         self.routes = self.A.routes
 
@@ -107,8 +107,8 @@ class TP:
                 cold.append(e)
                 continue
             self.hits += n
-            dev, ws = self.slots[L, e]
-            hot[dev].append((*ws, gate[:, e]))
+            dev, local = self.slots[L, e]
+            hot[dev].append((local, gate[:, e]))
         if hot[A]:
             ya = A.o.add(ya, A.slot_experts(x, hot[A]))
         if hot[B]:
@@ -124,7 +124,7 @@ class TP:
         B.t = A.t
         for L in range(c.num_hidden_layers):
             if L in A.ple:
-                h4 = A.o.add(h4, A.ple_layer(L, h4, list(tokens)))
+                h4 = A.ple_layer(L, h4, list(tokens))
             x, inj = A.hc_read(f"layers.{L}.attn_hyper_connection", h4)
             xb = self.to(B, x, A)
             if c.layer_types[L] == "linear_attention":
@@ -148,8 +148,9 @@ class TP:
         self.B.commit(j)
         for (L, e), ev, slot in self.cache.end_step():
             self.slots.pop(ev, None)
-            dev = self.A if slot < self.n_card else self.B
-            self.slots[L, e] = (dev, dev.upload(L, e))
+            dev, local = (self.A, slot) if slot < self.n_card else (self.B, slot - self.n_card)
+            dev.put_slot(local, L, e)
+            self.slots[L, e] = (dev, local)
 
     def lm_argmax(self, mixed):
         """Each device takes the best of its vocabulary rows; the host keeps the better of the two."""

@@ -268,16 +268,25 @@ routed expert in a slot, scaled to QFN's 48 layers and top-10):
 | before | 10,297 | 602 |
 | weights that read the same input stacked into one linear per format, one-op RMSNorm, RoPE as one matmul | 5,698 | 242 |
 | + experts as gate (SiLU fused) / up / down, gate weights applied once per layer, routing read once as [m, E] | 4,690 | 194 |
-| + traced segments: each DeltaNet layer's dense part, both dense ends of each attention layer (60 replays) | **4,054** | **194** |
+| + traced segments: each DeltaNet layer's dense part, both dense ends of each attention layer (60 replays) | 4,054 | 194 |
+| + slot experts as three gathered matmuls over weight banks (`ttnn.sparse_matmul`, indexed) | 1,174 | 170 |
+| + each MoE output written by the next layer's segment, attention heads batched, PLE traced | 1,144 | 170 |
+| + attention's per-token core and the slot experts traced (block scores over all blocks, rows padded to a fixed length) | **604** | **182** |
 
-(m = 3, an MTP verify pass: 17,952 → 7,992.) A traced segment ([`ops.trace`](device/ops.py)) is captured once and
-replayed from the card's trace buffer; on the CPU backend the emulation forbids host transfers inside it and writes
-every replay into the same output tensors, so `test_qfn.py` / `test_tp.py` also check that nothing traced reads the
-host or keeps a stale alias. The stacked weights round exactly as before (same BFP blocks: the tuff-format check gives
-the same 7.2e-2 / 96.3%). What is left is mostly the routed experts (4 ops each) and the per-token attention core.
+(m = 3, an MTP verify pass: 17,952 → 772.) A pass is now a chain of traced segments broken only where the host
+decides something: the routing read after each layer (48), the indexer's block choice per token in the attention
+layers (12), the LM head (1) — 61 reads, which the 182 transfers include; the rest are small writes (expert ids, gate
+weights, row ids) that queue behind the ops. A traced segment ([`ops.trace`](device/ops.py)) is captured once per
+shape and replayed from the card's trace buffer; on the CPU backend the emulation forbids host transfers inside it
+and writes every replay into the same output tensors, so `test_qfn.py` / `test_tp.py` also check that nothing traced
+reads the host or keeps a stale alias. The stacked weights round exactly as before (same BFP blocks: the tuff-format
+check gives the same 7.2e-2 / 96.3%).
 
-Not there yet: the per-token attention core on the card (ttnn's SDPA decode with the indexer's block choice),
-experts as one sparse matmul per layer, and a CUDA backend for ops.py (the GPU side runs on the
+The TTNN side of this is written from the ttnn docs and not run: `sparse_matmul`'s indexed mode, `fill_cache` into
+bfp4 banks, `embedding` for row gathers, `update_cache` for row writes, `begin/end_trace_capture` + `execute_trace`.
+`device/test_ops.py` checks each against the CPU backend first thing on the card.
+
+Not there yet: a CUDA backend for ops.py (the GPU side runs on the
 Torch backend; with torch on CUDA it is the same code).
 
 ## What exists
@@ -357,7 +366,7 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [ ] On the card: `device/test_ops.py`, then the card code; measure the real round trip and the card's bandwidth
 - [x] QFN's MTP drafter in the reference, on the real weights: chained drafts accepted 71% / 52% / 36%, 2.08 tokens per step
 - [x] MTP speculative decoding in the card code: verify + rollback, QFN's drafter, == plain greedy (CPU backend)
-- [x] Card dispatches per pass: 10,297 → 4,054 ops (fused linears, traced segments), counted by `device/opcount.py`
+- [x] Card dispatches per pass: 10,297 → 604 ops (fused linears, expert banks + sparse matmul, traced segments), counted by `device/opcount.py`
 - [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
 - [ ] N-gram table on NVMe with prefetch
 - [ ] AVX-512 kernels for the 8259CL, only if `bench/host.sh` shows cold experts compute-bound (on paper AVX2 already
@@ -410,8 +419,8 @@ reporting set to "OS First" in the BIOS.
 - **카드 + 4060 Ti 분할 실행**(`device/tp.py`): dense 연산을 헤드·행 단위로 두 장치에 나누고 부분합은 호스트에서 합침.
   전문가 슬롯은 두 장치를 하나의 캐시로 관리. 한 장치로 돌린 결과와 같고(1.6e-6), 추측 디코딩도 일반 greedy와 같음을 확인
 - **카드 연산 수 줄이기**(`device/opcount.py`): 같은 입력을 읽는 가중치를 하나의 linear로 합치고, RMSNorm·RoPE를 한 연산으로,
-  전문가는 SiLU를 matmul에 붙이고, dense 구간은 trace로 묶음. 토큰 1개 패스의 카드 연산이 10,297 → 4,054개, 호스트 왕복
-  602 → 194번. 결과·양자화 오차는 그대로
+  슬롯 전문가는 층마다 묶음 matmul 3번(sparse_matmul), 패스 전체를 trace 구간의 연결로 바꿈. 토큰 1개 패스의 카드 연산이
+  10,297 → 604개, 호스트가 기다리는 읽기는 층마다 라우팅 1번 + 어텐션 블록 선택뿐. 결과·양자화 오차는 그대로
 
 **다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 

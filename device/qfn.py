@@ -13,13 +13,17 @@ the tokens in order. Card.commit(j) then keeps the first j tokens: DeltaNet's pe
 the cache positions roll back to exactly that point. generate() does greedy speculative decoding with it, and must
 emit exactly the tokens plain greedy decoding emits (device/test_qfn.py checks this).
 
-Speed (device/opcount.py counts it): weights that read the same input are stacked into one linear per format (lins),
-RMSNorm is one op, RoPE's rotation one matmul, the routed experts' gate weights are applied in one go, and each
-DeltaNet layer's dense part (hyper-connection read, DeltaNet, the MLP's hyper-connection read, router, shared expert)
-runs as a traced segment (ops.trace): replayed from the card's trace buffer, with no Python dispatch, whenever a pass
-has m <= `trace` tokens.
-Attention layers trace their two dense ends; ponytail: the per-token core between them stays eager (the
-indexer's block choice goes through the host per token).
+Speed (device/opcount.py counts it): a pass is a chain of traced segments (ops.trace: captured once per shape,
+replayed from the card's trace buffer with no Python dispatch) broken only where the host must decide something:
+    each DeltaNet layer   one segment: the previous layer's MoE write, hyper-connection read, DeltaNet, the MLP's
+                          hyper-connection read, router, shared expert; then the routing read
+    each attention layer  projections + norms + RoPE for all m tokens; per token the indexer's block scores (read
+                          by the host, which picks the blocks) and attention over the chosen rows padded to a fixed
+                          length; then o_proj + the MLP's dense part
+    the slot experts      three gathered matmuls over per-device weight banks (ops.gather_matmul: only the chosen
+                          slots are read), traced per number of experts
+Inside, weights that read the same input are one linear per format (lins), RMSNorm one op, RoPE one matmul.
+Caches and banks are updated in place, so segments read them by address.
 """
 import math
 import sys
@@ -110,7 +114,8 @@ class Card:
         self.rd = int(c.head_dim * rp.get("partial_rotary_factor", 1.0))
         self.inv_freq = 1.0 / (rp["rope_theta"] ** (np.arange(0, self.rd, 2) / self.rd))
         self.gated_act = (c.output_gate_type or c.hidden_act) == "sigmoid"
-        self.dev, self.slots, self.routes = {}, {}, {}      # slots: (layer, expert) -> its weights on the card
+        self.dev, self.slots, self.routes = {}, {}, {}      # slots: (layer, expert) -> its expert slot
+        self.n_slots, self.banks = slots, None          # the slots' weights: one bank per matrix (gate, up, down)
         self.t, self.tokens = 0, []                    # committed tokens; the next one sits at position t
         self.hits = self.lookups = 0
         self.ple = {L - 1 for L in c.ple_layer_ids}
@@ -180,16 +185,20 @@ class Card:
     def rms(self, x, w):
         return self.o.rms_norm(x, w, self.eps)
 
-    def rope(self, x, pos):
-        """x [rows, D] of one token at RoPE position pos; partial rotary on the first rd features."""
-        o, rd, half = self.o, self.rd, self.rd // 2
-        f = pos * self.inv_freq
-        cos = self.const(("cos", pos), lambda: np.concatenate([np.cos(f)] * 2)[None])
-        sin = self.const(("sin", pos), lambda: np.concatenate([np.sin(f)] * 2)[None])
+    def cs(self, pos, n=1):
+        """RoPE cos and sin rows [n, rd] of positions pos .. pos+n-1, sliced from tables kept on the card"""
+        f = np.arange(self.max_t + 1)[:, None] * self.inv_freq[None]
+        cos = self.const("cos", lambda: np.concatenate([np.cos(f)] * 2, 1))
+        sin = self.const("sin", lambda: np.concatenate([np.sin(f)] * 2, 1))
+        return self.o.slice(cos, 0, pos, pos + n), self.o.slice(sin, 0, pos, pos + n)
+
+    def rope(self, x, cos, sin):
+        """x [..., D], partial rotary on the first rd features of the last dim; cos, sin broadcast to x[..., :rd]"""
+        o, rd, half, dim, D = self.o, self.rd, self.rd // 2, len(x.shape) - 1, x.shape[-1]
         P = self.const("rot", lambda: np.block([[np.zeros((half, half)), np.eye(half)], [-np.eye(half), np.zeros((half, half))]]))
-        r = o.slice(x, 1, 0, rd) if x.shape[1] > rd else x
+        r = o.slice(x, dim, 0, rd) if D > rd else x
         y = o.add(o.mul(r, cos), o.mul(o.matmul(r, P), sin))           # r @ P = [-r2, r1]
-        return o.concat([y, o.slice(x, 1, rd, x.shape[1])], 1) if x.shape[1] > rd else y
+        return o.concat([y, o.slice(x, dim, rd, D)], dim) if D > rd else y
 
     def hc_read(self, p, h4, combine=True):
         o, hc, d, m = self.o, self.hc, self.d, h4.shape[0]
@@ -237,57 +246,84 @@ class Card:
         return o.linear(o.reshape(out, (m, V * dv)), self.lin(p + ".out_proj")), win, states
 
     # ---- full attention with the QSA indexer; rows past the commit point are simply written again later
-    def attention(self, L, x, proj=None):
-        """proj: the four projections of x, when a traced segment already computed them"""
+    def attn_proj(self, L, x):
+        p = f"layers.{L}.self_attn"
+        return self.lins(x, [p + ".indexer.index_qk_proj", p + ".q_proj", p + ".k_proj", p + ".v_proj"])
+
+    def attn_prep(self, L, proj, cos, sin):
+        """The m tokens' projections normed and roped together (pure: it runs inside a trace); cos, sin [m, rd] of
+        their positions. -> (indexer keys, indexer queries, queries (both pre-scaled), output gate, keys, values)"""
+        o, c, p = self.o, self.c, f"layers.{L}.self_attn"
+        H, KV, hd, nh, ihd = c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.indexer_n_heads, c.indexer_head_dim
+        qk, qg, kk, vv = proj
+        m = qk.shape[0]
+        cos, sin = o.reshape(cos, (m, 1, self.rd)), o.reshape(sin, (m, 1, self.rd))
+        rr = lambda t, w: self.rope(self.rms(t, self.norm(p + w)), cos, sin)
+        iq = o.scale(rr(o.reshape(o.slice(qk, 1, 0, nh * ihd), (m, nh, ihd)), ".indexer.q_layernorm.weight"),
+                     1 / math.sqrt(ihd))
+        qg = o.reshape(qg, (m, H, 2 * hd))
+        q = o.scale(rr(o.slice(qg, 2, 0, hd), ".q_norm.weight"), 1 / math.sqrt(hd))
+        gate = o.sigmoid(o.reshape(o.slice(qg, 2, hd, 2 * hd), (m, H * hd)))
+        k = o.reshape(rr(o.reshape(kk, (m, KV, hd)), ".k_norm.weight"), (m, KV * hd))
+        return o.slice(qk, 1, nh * ihd, nh * ihd + ihd), iq, q, gate, k, vv
+
+    def attention(self, L, x, prep=None, raw=False):
+        """prep: attn_prep's outputs, when a traced segment already computed them. Per token: the indexer's block
+        scores (a traced segment over every block row), the choice on the host, then attention over the chosen rows
+        padded to a fixed n_max (another traced segment). The caches are updated in place, so traces read them by
+        address."""
         o, c, s, p = self.o, self.c, self.state[L], f"layers.{L}.self_attn"
         m, t0 = x.shape[0], self.t
         H, KV, hd = c.num_attention_heads, c.num_key_value_heads, c.head_dim
         nh, ihd, ratio = c.indexer_n_heads, c.indexer_head_dim, c.indexer_compress_ratio
-        qk, qg, kk, vv = proj or self.attn_proj(L, x)
-        s["idx"] = o.write_rows(s["idx"], t0, o.slice(qk, 1, nh * ihd, nh * ihd + ihd))      # raw keys
+        key, iq, q, gate, k, vv = prep or self.attn_prep(L, self.attn_proj(L, x), *self.cs(t0 + self.pos0, m))
+        s["idx"] = o.write_rows(s["idx"], t0, key)                                     # raw indexer keys
+        s["K"] = o.write_rows(s["K"], t0, k)
         s["V"] = o.write_rows(s["V"], t0, vv)
         G, outs = H // KV, []
+        n_max = c.indexer_budget // ratio * ratio + ratio - 1          # chosen blocks + the open block
+
+        def score(iq_i):                               # the block keys are read in place (persistent, by address)
+            return (o.sum(o.relu(o.matmul(o.reshape(iq_i, (nh, ihd)), o.transpose(s["blk"]))), 0),)
+
+        def attend(q_i, ids, mask):                    # all KV heads at once over the n_max gathered rows
+            Ks, Vs = o.gather_rows(s["K"], ids), o.gather_rows(s["V"], ids)            # [n_max, KV*hd]
+            a = o.softmax(o.add(o.matmul(o.reshape(q_i, (KV, G, hd)), o.permute(o.reshape(Ks, (n_max, KV, hd)), (1, 2, 0))),
+                                mask))                                                 # [KV, G, n_max]
+            return (o.reshape(o.matmul(a, o.permute(o.reshape(Vs, (n_max, KV, hd)), (1, 0, 2))), (1, H * hd)),)
         for i in range(m):
             t = t0 + i
             if (t + 1) % ratio == 0:                   # a block completes: pool, norm and rope its key once
                 b = t // ratio
                 blk = o.mean(o.slice(s["idx"], 0, b * ratio, (b + 1) * ratio), 0)
                 s["blk"] = o.write_rows(s["blk"], b, self.rope(self.rms(blk, self.norm(p + ".indexer.k_layernorm.weight")),
-                                                               b * ratio + self.pos0))
-            iq = self.rope(self.rms(o.reshape(o.slice(o.slice(qk, 0, i, i + 1), 1, 0, nh * ihd), (nh, ihd)),
-                                    self.norm(p + ".indexer.q_layernorm.weight")), t + self.pos0)
+                                                               *self.cs(b * ratio + self.pos0)))
             nb = (t + 1) // ratio
             keep = list(range(nb * ratio, t + 1))
-            if nb:
-                score = o.scale(o.sum(o.relu(o.matmul(iq, o.transpose(o.slice(s["blk"], 0, 0, nb)))), 0),
-                                1 / math.sqrt(ihd))
-                _, top = o.topk(score, min(c.indexer_budget // ratio, nb))
-                keep = sorted(int(j) * ratio + r for j in top[0] for r in range(ratio)) + keep
-            qi = o.reshape(o.slice(qg, 0, i, i + 1), (H, 2 * hd))
-            q = self.rope(self.rms(o.slice(qi, 1, 0, hd), self.norm(p + ".q_norm.weight")), t + self.pos0)
-            k = self.rope(self.rms(o.reshape(o.slice(kk, 0, i, i + 1), (KV, hd)), self.norm(p + ".k_norm.weight")), t + self.pos0)
-            s["K"] = o.write_rows(s["K"], t, o.reshape(k, (1, KV * hd)))
-            Ks, Vs = o.gather_rows(s["K"], keep), o.gather_rows(s["V"], keep)          # [n, KV*hd]
-            heads = []
-            for kv in range(KV):
-                a = o.softmax(o.scale(o.matmul(o.slice(q, 0, kv * G, (kv + 1) * G),
-                                               o.transpose(o.slice(Ks, 1, kv * hd, (kv + 1) * hd))), 1 / math.sqrt(hd)))
-                heads.append(o.matmul(a, o.slice(Vs, 1, kv * hd, (kv + 1) * hd)))
-            outs.append(o.mul(o.reshape(o.concat(heads, 0), (1, H * hd)),
-                              o.sigmoid(o.reshape(o.slice(qi, 1, hd, 2 * hd), (1, H * hd)))))
-        return o.linear(o.concat(outs, 0), self.lin(p + ".o_proj"))
+            if nb:                                     # all block scores (fixed shape) to the host; top blocks there
+                sc = o.get(self.seg((L, "score"), score, o.slice(iq, 0, i, i + 1), m=m)[0])[0, :nb]
+                top = np.argsort(-sc, kind="stable")[:min(c.indexer_budget // ratio, nb)]
+                keep = sorted(int(j) * ratio + r for j in top for r in range(ratio)) + keep
+            n = len(keep)                              # padded to n_max rows, the padding masked out
+            ids = o.put_ids(keep + [0] * (n_max - n), "uint32")
+            mask = o.put(np.where(np.arange(n_max) < n, 0.0, -1e9)[None, None])
+            outs.append(self.seg((L, "attend", i), attend, o.slice(q, 0, i, i + 1), ids, mask, m=m)[0])
+        return outs if raw else self.attn_out(L, gate, outs)
 
-    def attn_proj(self, L, x):
-        p = f"layers.{L}.self_attn"
-        return self.lins(x, [p + ".indexer.index_qk_proj", p + ".q_proj", p + ".k_proj", p + ".v_proj"])
+    def attn_out(self, L, gate, outs):
+        return self.o.linear(self.o.mul(self.o.concat(outs, 0), gate), self.lin(f"layers.{L}.self_attn.o_proj"))
 
     # ---- MoE: router on the card; slot experts on the card (each read once for all m rows), the rest on the host
-    def upload(self, L, e):
-        # ponytail: from the float weights; on the card this is tstore_expert_tt's tiles, copied as they are
-        # gate and up as two weights, so the gate's SiLU rides on its matmul (linear(..., act="silu"))
-        p, I = f"layers.{L}.mlp.experts.", self.c.moe_intermediate_size
+    def put_slot(self, slot, L, e):
+        """Expert e of layer L into expert slot `slot` of this device's banks (gate and up apart, so the gate's SiLU
+        rides on its matmul). ponytail: from the float weights; on the card these are tstore_expert_tt's tiles."""
+        o, d, I, f = self.o, self.d, self.c.moe_intermediate_size, self.expert_fmt
+        if self.banks is None:
+            self.banks = (o.bank(self.n_slots, d, I, f), o.bank(self.n_slots, d, I, f), o.bank(self.n_slots, I, d, f))
+        p = f"layers.{L}.mlp.experts."
         gu, dn = np.asarray(self.w[p + "gate_up_proj"][e]), np.asarray(self.w[p + "down_proj"][e])
-        return tuple(self.o.put_weight(a, self.expert_fmt) for a in (gu[:I], gu[I:], dn))
+        for bank, W in zip(self.banks, (gu[:I], gu[I:], dn)):
+            o.bank_write(bank, slot, W)
 
     def moe(self, L, x, dense=None):
         """dense: (router probabilities, shared expert output) when a trace already computed them"""
@@ -301,7 +337,7 @@ class Card:
             self.lookups += n
             if slot >= 0:
                 self.hits += n
-                hot.append((*self.slots[L, e], gate[:, e]))
+                hot.append((self.slots[L, e], gate[:, e]))
             else:
                 cold.append(e)
         if hot:
@@ -332,26 +368,38 @@ class Card:
         return (o.softmax(r[0]) if router else None), y
 
     def slot_experts(self, x, items):
-        """Routed experts in this device's slots on every row of x: items = [(gate, up, down, g [m] host weights, 0
-        where a token does not use it)] -> their weighted sum [m, d]. 4 ops per expert, 6 per call."""
-        o, ys = self.o, []
-        for wg, wu, dn, _ in items:
-            ys.append(o.linear(o.mul(o.linear(x, wg, act="silu"), o.linear(x, wu)), dn))
-        (m, d), n = ys[0].shape, len(ys)
-        G = o.put(np.stack([g for *_, g in items])[:, :, None])                      # [n, m, 1], one upload
-        return o.reshape(o.sum(o.mul(o.reshape(o.concat(ys, 0), (n, m, d)), G), 0), (m, d))
+        """Routed experts in this device's slots on every row of x: items = [(slot, g [m] host weights, 0 where a
+        token does not use it)] -> their weighted sum [m, d]. Each matrix is one gathered matmul over the banks
+        (ttnn.sparse_matmul, indexed: only those slots' weights are read), traced per number of experts."""
+        ids = self.o.put_ids([slot for slot, _ in items], "uint16")
+        G = self.o.put(np.stack([g for _, g in items])[:, :, None])                    # [n, m, 1]
+        return self.seg(("slots", len(items)), self.slot_core, x, ids, G)[0]
+
+    def slot_core(self, x, ids, G):
+        o, (m, d) = self.o, x.shape
+        bg, bu, bd = self.banks                        # updated in place by promote: traces read them by address
+        x3 = o.reshape(x, (1, m, d))
+        a = o.mul(o.gather_matmul(x3, bg, ids, act="silu"), o.gather_matmul(x3, bu, ids))   # [n, m, I]
+        return (o.reshape(o.sum(o.mul(o.gather_matmul(a, bd, ids), G), 0), (m, d)),)
 
     def promote(self):
         """After a step: the cache's copies into the card's slots."""
-        for (L, e), ev, _ in self.cache.end_step():
+        for (L, e), ev, slot in self.cache.end_step():
             self.slots.pop(ev, None)
-            self.slots[L, e] = self.upload(L, e)
+            self.slots[L, e] = slot
+            self.put_slot(slot, L, e)
 
     # ---- PLE: the host hashes the N-gram ids and sends the rows; the card gates and convolves
     def ple_layer(self, L, h4, tokens):
-        o, c, p, hc, d, s = self.o, self.c, f"layers.{L}.ple", self.hc, self.d, self.state[L]
+        """-> h4 with the PLE output added; the host's N-gram rows go up, the rest is a traced segment"""
+        emb = self.o.put(np.stack([self.host.ngram_rows(L, self.tokens + tokens[:i + 1]) for i in range(h4.shape[0])]))
+        h4, win = self.seg(("ple", L), lambda h4, emb, st: self.ple_core(L, h4, emb, st), h4, emb, self.state[L]["ple"])
+        self.pending[L, "ple"] = win
+        return h4
+
+    def ple_core(self, L, h4, emb, st):
+        o, c, p, hc, d = self.o, self.c, f"layers.{L}.ple", self.hc, self.d
         m = h4.shape[0]
-        emb = o.put(np.stack([self.host.ngram_rows(L, self.tokens + tokens[:i + 1]) for i in range(m)]))
         key = self.rms(o.reshape(o.linear(emb, self.lin(p + ".key_proj")), (m, hc, d)), self.norm(p + ".norm_key.weight", rows=hc))
         value = o.reshape(o.linear(emb, self.lin(p + ".value_proj")), (m, 1, d))
         query = self.rms(o.reshape(h4, (m, hc, d)), self.norm(p + ".norm_query.weight", rows=hc))
@@ -359,55 +407,65 @@ class Card:
         gate = o.mul(o.sqrt(o.clamp_min(o.abs(gate), 1e-6)), o.sign(gate))
         gv = o.mul(o.sigmoid(gate), value)                                             # [m, hc, d]
         gvn = o.reshape(self.rms(gv, self.norm(p + ".norm_conv.weight", rows=hc)), (m, hc * d))
-        win = o.concat([s["ple"], gvn], 0)                                             # last 9 + the m new
-        self.pending[L, "ple"] = win
+        win = o.concat([st, gvn], 0)                                                   # last 9 + the m new
         cw = self.const(p + ".conv", lambda: np.asarray(self.w[p + ".conv1d.weight"], np.float64)[:, 0, :].T)
         span = (c.ple_conv_kernel_size - 1) * c.ngram_size
         conv = [o.sum(o.mul(o.concat([o.slice(win, 0, j, j + 1) for j in range(i, i + span + 1, c.ngram_size)], 0), cw), 0)
                 for i in range(m)]
-        return o.add(o.reshape(gv, (m, hc * d)), o.silu(o.concat(conv, 0)))
+        return o.add(h4, o.add(o.reshape(gv, (m, hc * d)), o.silu(o.concat(conv, 0)))), win
 
     # ---- m tokens through the model, then keep j of them
     pos0 = 0                                           # RoPE position of cache row 0 (the MTP layer starts at 1)
 
     def layers(self, h4, tokens=()):
         """h4 [m, hc*d] residual rows of m consecutive positions starting at self.t -> after the last layer."""
-        self.pending = {}
+        self.pending, carry = {}, ()
         for L in range(self.c.num_hidden_layers):
             if L in self.ple:
-                h4 = self.o.add(h4, self.ple_layer(L, h4, list(tokens)))
-            h4 = (self.deltanet_layer if self.c.layer_types[L] == "linear_attention" else self.attention_layer)(L, h4)
-        return h4
+                h4, carry = self.settle(h4, carry), ()
+                h4 = self.ple_layer(L, h4, list(tokens))
+            h4, carry = (self.deltanet_layer if self.c.layer_types[L] == "linear_attention" else self.attention_layer)(L, h4, carry)
+        return self.settle(h4, carry)
 
-    def seg(self, name, fn, *args):
-        """fn(*args) as a traced segment when the pass has m <= self.trace tokens (fn: card ops only, no side
-        effects; its outputs are overwritten by its next replay), else eagerly"""
-        m = args[0].shape[0]
+    def settle(self, h4, carry):
+        """A layer's MoE output is written into the residual by the next layer's first traced segment (carry =
+        (inject weights, MoE output)); this writes it when no segment follows."""
+        return self.hc_write(h4, *carry) if carry else h4
+
+    def seg(self, name, fn, *args, m=None):
+        """fn(*args) as a traced segment when the pass has m (default: args[0]'s rows) <= self.trace tokens (fn: card
+        ops only, no side effects; its outputs are overwritten by its next replay), else eagerly"""
+        m = args[0].shape[0] if m is None else m
         return self.o.trace((id(self), name, m), fn, *args) if m <= self.trace else fn(*args)
 
-    def deltanet_layer(self, L, h4):
-        def dense(h4, conv, S):                        # everything up to the routing decision, on the card alone
+    def deltanet_layer(self, L, h4, carry=()):
+        def dense(h4, *rest):                          # everything up to the routing decision, on the card alone
+            *carry, conv, S = rest
+            h4 = self.settle(h4, carry)
             x, inj = self.hc_read(f"layers.{L}.attn_hyper_connection", h4)
             out, win, states = self.deltanet_core(L, x, conv, S)
             h4 = self.hc_write(h4, inj, out)
             x, inj = self.hc_read(f"layers.{L}.mlp_hyper_connection", h4)
             return (h4, x, inj, win, states) + self.dense_mlp(L, x)
-        h4, x, inj, win, states, probs, y = self.seg(L, dense, h4, self.state[L]["conv"], self.state[L]["S"])
+        h4, x, inj, win, states, probs, y = self.seg((L, len(carry)), dense, h4, *carry, self.state[L]["conv"],
+                                                     self.state[L]["S"])
         self.pending[L] = dict(win=win, states=states)
-        return self.hc_write(h4, inj, self.moe(L, x, (probs, y)))
+        return h4, (inj, self.moe(L, x, (probs, y)))
 
-    def attention_layer(self, L, h4):
-        def pre(h4):
+    def attention_layer(self, L, h4, carry=()):
+        def pre(h4, *rest):
+            *carry, cos, sin = rest
+            h4 = self.settle(h4, carry)
             x, inj = self.hc_read(f"layers.{L}.attn_hyper_connection", h4)
-            return (x, inj, *self.attn_proj(L, x))
+            return (h4, x, inj) + tuple(self.attn_prep(L, self.attn_proj(L, x), cos, sin))
 
-        def post(h4, inj, out):
-            h4 = self.hc_write(h4, inj, out)
+        def post(h4, inj, gate, *outs):
+            h4 = self.hc_write(h4, inj, self.attn_out(L, gate, outs))
             x, inj = self.hc_read(f"layers.{L}.mlp_hyper_connection", h4)
             return (h4, x, inj) + self.dense_mlp(L, x)
-        x, inj, *proj = self.seg((L, "pre"), pre, h4)
-        h4, x, inj, probs, y = self.seg((L, "post"), post, h4, inj, self.attention(L, x, proj))
-        return self.hc_write(h4, inj, self.moe(L, x, (probs, y)))
+        h4, x, inj, *prep = self.seg((L, "pre", len(carry)), pre, h4, *carry, *self.cs(self.t + self.pos0, h4.shape[0]))
+        h4, x, inj, probs, y = self.seg((L, "post"), post, h4, inj, prep[3], *self.attention(L, x, prep, raw=True))
+        return h4, (inj, self.moe(L, x, (probs, y)))
 
     def verify(self, tokens):
         """The next m tokens (the last accepted token and m-1 drafts) in one pass; returns their mixer outputs [m, d].

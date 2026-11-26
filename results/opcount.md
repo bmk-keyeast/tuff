@@ -1,25 +1,25 @@
 # Card ops per decode pass (device/opcount.py)
 
-Every routed expert in a slot (the most ops a pass can take); a cold expert costs the host instead.
+Every routed expert in a slot; a cold expert adds a host read and write per layer instead.
 
 m = 1 token(s) per pass
 
-| part | card ops | host transfers | through the host (TTNN, for now) | trace replays | QFN count | QFN card ops |
+| part | card ops | host reads | host writes | trace replays | in QFN | QFN card ops |
 |---|---:|---:|---:|---:|---:|---:|
-| DeltaNet layer | 8 | 1 | 0 | 1 | 36 | 288 |
-| attention layer | 91 | 3 | 6 | 2 | 12 | 1,092 |
-| PLE (layer 1) | 32 | 1 | 0 | 0 | 1 | 32 |
-| routed experts in slots, per expert | 6 | 0 | 0 | 0 | 480 | 2,640 |
+| DeltaNet layer (its MoE but the slot experts) | 3 | 1 | 0 | 1 | 36 | 108 |
+| attention layer (its MoE but the slot experts) | 29 | 2 | 2 | 4 | 12 | 348 |
+| routed experts in slots, per layer (any number) | 3 | 0 | 2 | 1 | 48 | 144 |
+| PLE (layer 1) | 2 | 0 | 1 | 1 | 1 | 2 |
 | LM head + argmax | 2 | 1 | 0 | 0 | 1 | 2 |
-| **one pass** | | | | | | **4,054** ops, 194 host transfers, 72 through the host, 60 trace replays |
+| **one pass** | | | | | | **604** ops, 61 host reads, 121 host writes, 133 trace replays |
 
 m = 3 token(s) per pass
 
-| part | card ops | host transfers | through the host (TTNN, for now) | trace replays | QFN count | QFN card ops |
+| part | card ops | host reads | host writes | trace replays | in QFN | QFN card ops |
 |---|---:|---:|---:|---:|---:|---:|
-| DeltaNet layer | 8 | 1 | 0 | 1 | 36 | 288 |
-| attention layer | 223 | 7 | 12 | 2 | 12 | 2,676 |
-| PLE (layer 1) | 46 | 1 | 0 | 0 | 1 | 46 |
-| routed experts in slots, per expert | 5 | 0 | 0 | 0 | 1065 | 4,980 |
+| DeltaNet layer (its MoE but the slot experts) | 3 | 1 | 0 | 1 | 36 | 108 |
+| attention layer (its MoE but the slot experts) | 43 | 4 | 6 | 8 | 12 | 516 |
+| routed experts in slots, per layer (any number) | 3 | 0 | 2 | 1 | 48 | 144 |
+| PLE (layer 1) | 2 | 0 | 1 | 1 | 1 | 2 |
 | LM head + argmax | 2 | 1 | 0 | 0 | 1 | 2 |
-| **one pass** | | | | | | **7,992** ops, 242 host transfers, 144 through the host, 60 trace replays |
+| **one pass** | | | | | | **772** ops, 85 host reads, 169 host writes, 181 trace replays |

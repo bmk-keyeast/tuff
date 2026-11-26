@@ -18,7 +18,7 @@ from ops import Torch, TTNN  # noqa: E402
 
 def main():
     import ttnn
-    dev = ttnn.open_device(device_id=0, trace_region_size=1 << 20)   # ponytail: qfn's 60 segments need more; size from the error
+    dev = ttnn.open_device(device_id=0, trace_region_size=1 << 20)   # ponytail: qfn's segments need more; size it from the capture error
     a, b = Torch(), TTNN(dev)
     rng = np.random.default_rng(0)
     x, y = rng.standard_normal((4, 96)), rng.standard_normal((4, 96))
@@ -28,6 +28,12 @@ def main():
     kn = qn[:, ::-1].copy()
     v, g = rng.standard_normal((3, 8, 16)), -np.abs(rng.standard_normal((3, 8)))           # 8 value heads
     beta, S = 1 / (1 + np.exp(-rng.standard_normal((3, 8)))), 0.1 * rng.standard_normal((8, 16, 16))
+    def bank(o, fill):
+        bk = o.bank(4, 96, 64, "bfp4")
+        for i in fill:
+            o.bank_write(bk, i, wt * (i + 1))
+        return bk
+
     tests = {
         "linear (weight bf16)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bf16")),
         "linear (weight bfp8)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bfp8")),
@@ -46,7 +52,12 @@ def main():
         "softmax": lambda o: o.softmax(o.put(x)),
         "reshape / slice / concat / transpose": lambda o: o.transpose(o.concat(
             [o.slice(o.reshape(o.put(x), (8, 48)), 1, 0, 16), o.slice(o.reshape(o.put(y), (8, 48)), 1, 16, 32)], 0)),
-        "gather_rows / write_rows": lambda o: o.gather_rows(o.write_rows(o.put(x), 1, o.put(y[:2])), [3, 2, 0]),
+        "gather_rows / write_rows": lambda o: o.gather_rows(o.write_rows(o.put(x), 1, o.put(y[:2])), o.put_ids([3, 2, 0])),
+        "permute (3-D)": lambda o: o.permute(o.reshape(o.put(x), (4, 8, 12)), (1, 2, 0)),
+        "expert bank: bank_write + gathered matmul (broadcast x, fused silu)": lambda o: o.gather_matmul(
+            o.reshape(o.put(x[:2]), (1, 2, 96)), bank(o, (2, 0)), o.put_ids([2, 0], "uint16"), act="silu"),
+        "expert bank: gathered matmul, one x per slot": lambda o: o.gather_matmul(
+            o.reshape(o.put(np.concatenate([x[:2], y[:2]])), (2, 2, 96)), bank(o, (1, 2)), o.put_ids([1, 2], "uint16")),
         "topk (stable, per row)": lambda o: o.put(np.asarray(o.topk(o.put(np.round(x * 4) / 4), 8)[1], np.float64)),
         "gated delta rule, 3 tokens (output)": lambda o: o.gdr(o.put(qn), o.put(kn), o.put(v), o.put(g),
                                                                o.put(beta), o.put(S), 0.25)[0],

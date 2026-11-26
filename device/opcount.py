@@ -21,9 +21,8 @@ import qfn  # noqa: E402
 from ops import Torch  # noqa: E402
 from test_qfn import tiny, weights  # noqa: E402
 
-HOST = {"get", "put", "topk"}            # host <-> card transfers (topk: its indices come back to the host)
-VIA_HOST = {"gather_rows", "write_rows"}  # one op on Torch, but through the host in ops.TTNN for now
-
+READ = {"get", "topk"}       # card -> host: the host waits for the card here (topk: its indices come back)
+WRITE = {"put", "put_ids"}   # host -> card: queued behind the ops, no wait
 
 class Counted:
     """ops wrapper counting calls per (section, op); the section is the innermost Card method being run."""
@@ -74,7 +73,7 @@ def count(m=1, T=40):
     calls = Counter()
     sections(card, ops, ["ple_layer", "deltanet_layer", "attention_layer", "slot_experts", "lm_argmax"])
     ex = card.slot_experts
-    card.slot_experts = lambda x, items: (calls.update(n=len(items)), ex(x, items))[1]
+    card.slot_experts = lambda x, items: (calls.update(n=1), ex(x, items))[1]
     ids = [int(t) for t in np.random.default_rng(1).integers(0, c.vocab_size, T)]
     card.lm_argmax(card.verify(ids[:T - m]))           # prompt; then every expert it routed to sits in a slot
     card.commit(T - m)
@@ -87,33 +86,29 @@ def count(m=1, T=40):
 
 
 def table(m):
-    n, kinds, n_exp = count(m)
-    c = tiny()
-    kinds_l, k_tok = c.layer_types[:c.num_hidden_layers], c.num_experts_per_tok   # distinct experts per layer, scaled to top-10
+    n, kinds, n_calls = count(m)
     per = lambda sec, ops=None: sum(v for (s, op), v in n.items() if s == sec and (ops is None or op in ops))
-    rows = [("DeltaNet layer", "deltanet_layer", kinds["linear_attention"], 36),
-            ("attention layer", "attention_layer", kinds["full_attention"], 12),
+    rows = [("DeltaNet layer (its MoE but the slot experts)", "deltanet_layer", kinds["linear_attention"], 36),
+            ("attention layer (its MoE but the slot experts)", "attention_layer", kinds["full_attention"], 12),
+            ("routed experts in slots, per layer (any number)", "slot_experts", max(n_calls, 1), 48),
             ("PLE (layer 1)", "ple_layer", 1, 1),
-            ("routed experts in slots, per expert", "slot_experts", max(n_exp, 1),
-             round(48 * 10 * n_exp / len(kinds_l) / k_tok)),
             ("LM head + argmax", "lm_argmax", 1, 1)]
     out = [f"m = {m} token(s) per pass", "",
-           "| part | card ops | host transfers | through the host (TTNN, for now) | trace replays | QFN count | QFN card ops |",
+           "| part | card ops | host reads | host writes | trace replays | in QFN | QFN card ops |",
            "|---|---:|---:|---:|---:|---:|---:|"]
     tot = Counter()
     for label, sec, k, qfn_n in rows:
-        a, h, v, r = (per(sec) / k, per(sec, HOST) / k, per(sec, VIA_HOST) / k, per(sec, {"trace replay"}) / k)
-        out.append(f"| {label} | {a:.0f} | {h:.0f} | {v:.0f} | {r:.0f} | {qfn_n} | {a * qfn_n:,.0f} |")
-        tot.update(ops=a * qfn_n, host=h * qfn_n, via=v * qfn_n, replay=r * qfn_n)
-    out.append(f"| **one pass** | | | | | | **{tot['ops']:,.0f}** ops, {tot['host']:,.0f} host transfers, "
-               f"{tot['via']:,.0f} through the host, {tot['replay']:,.0f} trace replays |")
+        a, rd, wr, r = per(sec) / k, per(sec, READ) / k, per(sec, WRITE) / k, per(sec, {"trace replay"}) / k
+        out.append(f"| {label} | {a:.0f} | {rd:.0f} | {wr:.0f} | {r:.0f} | {qfn_n} | {a * qfn_n:,.0f} |")
+        tot.update(ops=a * qfn_n, rd=rd * qfn_n, wr=wr * qfn_n, replay=r * qfn_n)
+    out.append(f"| **one pass** | | | | | | **{tot['ops']:,.0f}** ops, {tot['rd']:,.0f} host reads, "
+               f"{tot['wr']:,.0f} host writes, {tot['replay']:,.0f} trace replays |")
     return "\n".join(out)
-
 
 if __name__ == "__main__":
     text = "\n\n".join(table(m) for m in (1, 3))
     print(text)
     if "--md" in sys.argv:
         Path(sys.argv[sys.argv.index("--md") + 1]).write_text(
-            "# Card ops per decode pass (device/opcount.py)\n\nEvery routed expert in a slot (the most ops a pass "
-            "can take); a cold expert costs the host instead.\n\n" + text + "\n", encoding="utf-8")
+            "# Card ops per decode pass (device/opcount.py)\n\nEvery routed expert in a slot; a cold expert adds a "
+            "host read and write per layer instead.\n\n" + text + "\n", encoding="utf-8")
