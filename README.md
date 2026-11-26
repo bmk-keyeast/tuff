@@ -457,8 +457,13 @@ reporting set to "OS First" in the BIOS.
   10,297 → 604개, 호스트가 기다리는 읽기는 층마다 라우팅 1번 + 어텐션 블록 선택뿐. 결과·양자화 오차는 그대로
 - **프롬프트 처리(prefill)**: 512토큰씩 한 번에. 어텐션은 마스크로 모든 토큰을 한 번에 계산하고, DeltaNet은 마지막 상태만
   남겨 메모리를 아낌(토큰별 상태는 512토큰이면 층마다 1.5GB). 결과가 ref.py와 같음을 확인
+- **MTP 초안 모델 개선**: 채택된 토큰들의 캐시를 스텝마다 한 번에 채움(이전엔 토큰마다, LM head까지 읽음).
+  초안 전용 단어장(draft vocabulary)도 지원
+- **실행 스크립트**(`device/run.py`): 실제 체크포인트 + ttnn + C 호스트 + MTP를 한 번에 연결. `--gpu`면 4060 Ti와 분할.
+  4060 Ti 쪽은 BFP 가중치를 그대로 GPU에 두고 CUDA 커널로 계산(`ops.CUDA`). 카드·GPU가 없어 아직 미실행
+- **카드 첫 실행 검사**(`device/test_ops.py`): 연산 하나하나를 CPU와 비교한 뒤, 카드 코드 전체(trace, MTP 포함)를 CPU 결과와 비교
 
-**다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고, `device/run.py`로 실제 생성·속도 측정, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
+**다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고, `device/run.py`로 실제 생성·속도 측정(호출당 8µs 가정을 실측으로 교체), 4060 Ti에서 `test_cuda`·`device/test_cuda_ops.py` 실행, 전문가 복사 엔진.
 
 ## License
 
