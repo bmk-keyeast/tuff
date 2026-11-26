@@ -340,10 +340,11 @@ class Card:
                 hot.append((self.slots[L, e], gate[:, e]))
             else:
                 cold.append(e)
-        if hot:
-            y = o.add(y, self.slot_experts(x, hot))
+        xh = o.get(x) if cold else None                # x is ready (the routing read waited for it); read it before
+        if hot:                                        # queueing the slot experts, so the host's cold experts run
+            y = o.add(y, self.slot_experts(x, hot))    # while the card computes its own
         if cold:                                          # the only vectors that cross the bus: X out, the sum back
-            y = o.add(y, o.put(self.host.experts(L, o.get(x), cold, gate[:, cold].T)))
+            y = o.add(y, o.put(self.host.experts(L, xh, cold, gate[:, cold].T)))
         return y
 
     def route(self, L, probs):

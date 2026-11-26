@@ -42,9 +42,9 @@ With tuff-mix2 experts, 90.8% of the routed experts are the same as with bf16.
 
 | Text | 0 copies | 10 copies | 25 copies | 50 copies | 100 copies |
 |---|---:|---:|---:|---:|---:|
-| wikitext | 67.1% (31.1 t/s) | 89.2% (37.2 t/s) | 93.8% (36.8 t/s) | 94.9% (36.7 t/s) | 95.1% (36.7 t/s) |
-| code | 32.7% (24.0 t/s) | 64.5% (29.9 t/s) | 86.2% (35.6 t/s) | 90.4% (36.3 t/s) | 91.3% (36.1 t/s) |
-| wikitext then code | 49.9% (27.1 t/s) | 75.8% (33.0 t/s) | 89.7% (37.0 t/s) | 92.3% (36.9 t/s) | 93.1% (36.9 t/s) |
+| wikitext | 67.1% (29.4 t/s) | 89.2% (33.1 t/s) | 93.8% (32.8 t/s) | 94.9% (32.8 t/s) | 95.1% (32.7 t/s) |
+| code | 32.7% (23.0 t/s) | 64.5% (28.3 t/s) | 86.2% (33.3 t/s) | 90.4% (33.1 t/s) | 91.3% (33.0 t/s) |
+| wikitext then code | 49.9% (25.8 t/s) | 75.8% (31.1 t/s) | 89.7% (33.1 t/s) | 92.3% (32.9 t/s) | 93.1% (32.9 t/s) |
 
 ### Experts per layer when m consecutive tokens are verified together (MTP)
 
@@ -65,12 +65,12 @@ Adaptive cache with up to 25 copies per token, hit rate measured on 'wikitext th
 
 | Host | Dense on card | Hit rate | no MTP | prose | chat | structured | QFN MTP (measured) |
 |---|---|---:|---:|---:|---:|---:|---:|
-| E5-2690v4, 4x16GB | bfp8 | 89.7% | 37.0 | 59.3 | 67.8 | 125.7 | 54.5 |
-| E5-2690v4, 4x16GB | tuff-mix | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 | 60.9 |
-| E5-2690v4, 4x16GB | tuff-mix2 | 90.4% | 45.3 | 70.6 | 80.5 | 147.6 | 64.8 |
-| 8259CL, 6x32GB | bfp8 | 89.7% | 37.2 | 60.2 | 69.0 | 130.1 | 55.4 |
-| 8259CL, 6x32GB | tuff-mix | 90.1% | 41.3 | 67.3 | 77.3 | 147.6 | 61.9 |
-| 8259CL, 6x32GB | tuff-mix2 | 90.4% | 45.3 | 71.9 | 82.2 | 153.6 | 66.1 |
+| E5-2690v4, 4x16GB | bfp8 | 89.7% | 33.1 | 52.7 | 60.1 | 110.3 | 48.4 |
+| E5-2690v4, 4x16GB | tuff-mix | 90.1% | 36.4 | 58.0 | 66.3 | 122.7 | 53.3 |
+| E5-2690v4, 4x16GB | tuff-mix2 | 90.4% | 39.4 | 61.4 | 69.8 | 126.8 | 56.3 |
+| 8259CL, 6x32GB | bfp8 | 89.7% | 33.1 | 53.3 | 61.1 | 113.7 | 49.1 |
+| 8259CL, 6x32GB | tuff-mix | 90.1% | 36.4 | 58.8 | 67.4 | 126.8 | 54.1 |
+| 8259CL, 6x32GB | tuff-mix2 | 90.4% | 39.4 | 62.3 | 71.1 | 131.2 | 57.3 |
 
 ### With an RTX 4060 Ti 16 GB next to the p150a
 
@@ -78,9 +78,9 @@ Dense on the card as tuff's default (LM head and DeltaNet z in BFP4, the rest BF
 
 | Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | prose | chat | structured | QFN MTP (measured) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| p150a only | 0% | 10,019 + 0 | 90.1% | 41.3 | 66.2 | 75.8 | 142.1 | 60.9 |
-| + 4060 Ti, expert cache | 0% | 10,019 + 5,631 | 97.1% | 44.1 | 73.7 | 84.9 | 163.1 | 68.0 |
-| + 4060 Ti, expert cache + split dense | 41% | 10,581 + 4,791 | 97.0% | 55.7 | 86.8 | 98.8 | 179.6 | 79.6 |
+| p150a only | 0% | 10,019 + 0 | 90.1% | 36.4 | 58.0 | 66.3 | 122.7 | 53.3 |
+| + 4060 Ti, expert cache | 0% | 10,019 + 5,631 | 97.1% | 38.5 | 63.7 | 73.2 | 138.0 | 58.7 |
+| + 4060 Ti, expert cache + split dense | 41% | 10,581 + 4,791 | 97.0% | 47.1 | 73.2 | 83.2 | 149.7 | 67.2 |
 
 ### Predicted decode with the measured hit rate
 
@@ -88,8 +88,8 @@ plan.py's model with the hit rate measured for Basalt's profile on wikitext (E5-
 
 | Dense on card | Hit rate | t/s |
 |---|---:|---:|
-| bfp8 | 67.1% | 31.1 |
-| bfp4 | 70.3% | 46.6 |
+| bfp8 | 67.1% | 29.4 |
+| bfp4 | 70.3% | 42.9 |
 
 ### Which dense groups tolerate BFP4
 
@@ -97,4 +97,4 @@ Each row is tuff with one dense group in BFP4 instead of BFP8; ΔKLD and Δtop-1
 
 | Group | Params | Card GB saved | ΔKLD | Δ top-1 | Cumulative ΔKLD | Cumulative t/s |
 |---|---:|---:|---:|---:|---:|---:|
-| (tuff: all BFP8) | | | | | 0 | 37.0 |
+| (tuff: all BFP8) | | | | | 0 | 33.1 |

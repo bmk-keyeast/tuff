@@ -39,14 +39,17 @@ trace that switches from prose to code. **MTP, measured**: QFN's own drafter run
 ([`ref_real.py`](ref_real.py)), chained greedy drafts on wikitext: draft 1 accepted 71%, draft 2 52%, draft 3 36%
 (2 drafts per step is fastest, 2.08 tokens per step). The chat and structured columns borrow Basalt's community
 acceptance for those kinds of text. Dense formats: see [which dense groups tolerate BFP4](#which-dense-weights-tolerate-bfp4).
+The model charges the host's control of the card too: per token 61 reads the card waits on (30 µs round trip + 3 calls
+each) and 604 calls the host must issue, counted on the card code by [`device/opcount.py`](device/opcount.py) at an
+assumed 8 µs per call (to be measured on the card); that costs ~12% against the bandwidth-only numbers.
 
 | Dense weights on the card | KLD (wikitext / code) | no MTP | **MTP, measured (prose)** | MTP, chat (Basalt's rate) | MTP, structured (Basalt's rate) |
 |---|---:|---:|---:|---:|---:|
-| all BFP8 | 0.086 / 0.051 | 37 t/s | 55 t/s | 68 t/s | 126 t/s |
-| **tuff default: LM head + DeltaNet z in BFP4** | **0.113 / 0.060** | **41 t/s** | **61 t/s** | **76 t/s** | **142 t/s** |
-| tuff fast: + DeltaNet qkv in BFP4 | 0.131 / 0.073 | 45 t/s | 65 t/s | 81 t/s | 148 t/s |
-| static placement (Basalt's profile), all BFP8, no MTP | | 27 t/s | | | |
-| **default + an RTX 4060 Ti 16 GB** (dense split, shared expert cache) | 0.113 / 0.060 | **56 t/s** | **80 t/s** | **99 t/s** | **180 t/s** |
+| all BFP8 | 0.086 / 0.051 | 33 t/s | 48 t/s | 60 t/s | 110 t/s |
+| **tuff default: LM head + DeltaNet z in BFP4** | **0.113 / 0.060** | **36 t/s** | **53 t/s** | **66 t/s** | **123 t/s** |
+| tuff fast: + DeltaNet qkv in BFP4 | 0.131 / 0.073 | 39 t/s | 56 t/s | 70 t/s | 127 t/s |
+| static placement (Basalt's profile), all BFP8, no MTP | | 26 t/s | | | |
+| **default + an RTX 4060 Ti 16 GB** (dense split, shared expert cache) | 0.113 / 0.060 | **47 t/s** | **67 t/s** | **83 t/s** | **150 t/s** |
 
 How it gets there, each step measured on the real model on CI:
 
@@ -105,9 +108,9 @@ default formats, adaptive cache measured on the prose→code trace):
 
 | Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | MTP, measured (prose) | MTP chat (Basalt's rate) | MTP structured (Basalt's rate) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| p150a only | – | 10,019 | 90.1% | 41.3 | 60.9 | 75.8 | 142.1 |
-| + 4060 Ti as an expert cache | 0% | 10,019 + 5,631 | 97.1% | 44.1 | 68.0 | 84.9 | 163.1 |
-| **+ 4060 Ti, dense split + expert cache** | 41% | 10,581 + 4,791 | 97.0% | **55.7** | **79.6** | **98.8** | **179.6** |
+| p150a only | – | 10,019 | 90.1% | 36.4 | 53.3 | 66.3 | 122.7 |
+| + 4060 Ti as an expert cache | 0% | 10,019 + 5,631 | 97.1% | 38.5 | 58.7 | 73.2 | 138.0 |
+| **+ 4060 Ti, dense split + expert cache** | 41% | 10,581 + 4,791 | 97.0% | **47.1** | **67.2** | **83.2** | **149.7** |
 
 - **Expert cache only** helps little: at 90% card hits the CPU is no longer the slow side.
 - **Dense split (tensor parallel)** is what pays: every attention and DeltaNet layer is split by heads, the shared expert
@@ -273,7 +276,8 @@ routed expert in a slot, scaled to QFN's 48 layers and top-10):
 | + each MoE output written by the next layer's segment, attention heads batched, PLE traced | 1,144 | 170 |
 | + attention's per-token core and the slot experts traced (block scores over all blocks, rows padded to a fixed length) | **604** | **182** |
 
-(m = 3, an MTP verify pass: 17,952 → 772.) A pass is now a chain of traced segments broken only where the host
+(m = 3, an MTP verify pass: 17,952 → 772.) At an assumed 8 µs per call, the first column alone would have cost 82 ms of host time per
+token (a ceiling near 12 t/s); now it is 5 ms, which the card's own work mostly hides (`plan.host_busy`). A pass is now a chain of traced segments broken only where the host
 decides something: the routing read after each layer (48), the indexer's block choice per token in the attention
 layers (12), the LM head (1) — 61 reads, which the 182 transfers include; the rest are small writes (expert ids, gate
 weights, row ids) that queue behind the ops. A traced segment ([`ops.trace`](device/ops.py)) is captured once per
@@ -396,13 +400,13 @@ reporting set to "OS First" in the BIOS.
   - 기본값: LM head + DeltaNet z만 BFP4 (KLD 0.113 / 0.060). 빠른 모드: DeltaNet qkv까지 BFP4
 - 실제 라우팅 기록 분석: Basalt의 고정 배치는 글에서 67%, 코드에서 33%만 카드에 적중. 적응형 캐시(놓친 전문가를 토큰당 25개까지 카드로 복사)는 주제가 바뀌어도 약 90% 적중
 
-**예측 속도 (E5-2690 v4, 64GB, 기본값):** MTP 없이 41 t/s, **QFN 자체 MTP 초안 모델을 실제 가중치로 잰 채택률(71% / 52% / 36%) 기준 61 t/s**, 4060 Ti와 같이 쓰면 56 t/s / MTP 80 t/s. 대화·구조화 출력은 Basalt의 채택률을 빌리면 76 / 142 t/s.
+**예측 속도 (E5-2690 v4, 64GB, 기본값):** MTP 없이 36 t/s, **QFN 자체 MTP 초안 모델을 실제 가중치로 잰 채택률(71% / 52% / 36%) 기준 53 t/s**, 4060 Ti와 같이 쓰면 47 t/s / MTP 67 t/s. 대화·구조화 출력은 Basalt의 채택률을 빌리면 66 / 123 t/s. (호스트가 카드를 제어하는 시간까지 넣은 값: 토큰당 읽기 61번, 연산 호출 604번, 호출당 8µs 가정)
 실제 하드웨어 측정이 아니라 측정한 라우팅으로 계산한 예측입니다.
 
 - 적응형 캐시를 C 엔진 코드(`tcache`)로 구현: 실제 라우팅 기록을 재생해 Python 시뮬레이션과 0.1% 이내로 일치
 - 변환된 전문가 파일을 복사 없이 바로 쓰는 저장소(`tstore`). 전문가 전체가 68GB라 적응형 캐시에는 128GB 램이 맞음
 - **RTX 4060 Ti 병렬 처리 검토 결과: 가능하고 효과가 큼.** 카드의 dense 연산을 헤드 단위로 나눠 4060 Ti와 같이 돌리면
-  예측 56 t/s (카드만 41), MTP 사용 시 87~180 t/s. 나누는 방식이 수학적으로 정확한지는 HF 코드로 검증(`tp_check.py`).
+  예측 47 t/s (카드만 36), MTP 사용 시 67~150 t/s. 나누는 방식이 수학적으로 정확한지는 HF 코드로 검증(`tp_check.py`).
   4060 Ti용 CUDA 커널도 작성(CI 컴파일 통과, 실제 GPU에서는 아직 미실행)
 - 실제 호스트가 준비되면 돌릴 측정 스크립트(`bench/host.sh`)
 - 호스트 BFP 반올림을 tt-metal과 똑같이 맞춤(동률은 짝수 쪽). 이전에는 동률에서 달라 카드로 옮길 때 값이 미세하게 바뀔 수 있었음.

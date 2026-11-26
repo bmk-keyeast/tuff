@@ -77,6 +77,26 @@ HOSTS = {
 PCIE = 15.75 * GB
 # ponytail: one efficiency knob per link, replaced by bench/ numbers on the real box
 CPU_EFF, PCIE_EFF, PCIE_RT_US = 0.70, 0.80, 30.0
+# Host control of the card per pass of m tokens, counted by device/opcount.py on the card code: ttnn calls + trace
+# replays (DISPATCH), and reads the host waits on (READS: the routing read per layer, the indexer's block choice per
+# token in each attention layer, the LM head). Calls are queued while the card works, so the card only waits, per
+# read, for the round trip and the ~3 calls that give it its next work (expert ids, gate weights, the replay); the
+# host must still issue every call within the pass. ponytail: DISPATCH_US is a guess for one call; measure it.
+DISPATCH = lambda m: 520 + 84 * m
+READS = lambda m: QFN["L"] + QFN["L"] // QFN["full_every"] * m + 1
+DISPATCH_US, AFTER_READ = 8.0, 3
+
+
+def host_busy(m):
+    """Seconds of host time per pass spent driving the card (a floor on the pass)."""
+    return (READS(m) * PCIE_RT_US + DISPATCH(m) * DISPATCH_US) * 1e-6
+
+
+def t_control(m):
+    """Seconds per pass the card waits on the host."""
+    return READS(m) * (PCIE_RT_US + AFTER_READ * DISPATCH_US) * 1e-6
+
+
 HOST_RESERVE = 6 * GiB
 NGRAM_BYTES_PER_PARAM = 28.8e9 / 51.2e9   # Strata's quantized N-gram shard: 28.8 GB for 51.2B params
 
@@ -112,9 +132,11 @@ def decode(host, hit=None, dense_fmt="bfp8", expert_fmt="bfp4", ctx=4096, promot
     t_dense = (mm["dense"] + mm["kv"] + mm["state"]) / dev_bw
     t_hot = h * tok_experts / dev_bw
     t_cold = ((1 - h) * tok_experts + promote * mm["eb"]) / cpu_bw
-    t_pcie = m["L"] * (PCIE_RT_US * 1e-6 + 2 * m["d"] * 2 / (PCIE * PCIE_EFF))
-    t = max(t_dense + max(t_hot, t_cold + t_pcie), t_pcie + promote * mm["eb"] / (PCIE * PCIE_EFF))
-    return 1 / t, dict(dense=t_dense, hot=t_hot, cold=t_cold, pcie=t_pcie)
+    t_pcie = m["L"] * 2 * m["d"] * 2 / (PCIE * PCIE_EFF)
+    t_ctl = t_control(1)
+    t = max(t_dense + t_ctl + max(t_hot, t_cold + t_pcie), t_ctl + t_pcie + promote * mm["eb"] / (PCIE * PCIE_EFF),
+            host_busy(1))
+    return 1 / t, dict(dense=t_dense, hot=t_hot, cold=t_cold, pcie=t_pcie + t_ctl)
 
 
 DRAFT_VOCAB = 106_299   # ponytail: Basalt's convert/draft_vocab.bin read as int32 ids; replace with the real count
@@ -179,14 +201,16 @@ def decode_multi(host, gpu, u_card, u_gpu, u_cold, m=1, accepted=1, dense_fmt="b
     t_hot = q["L"] * u_card * mm["eb"] / a
     t_gpu = (q["L"] * (u_gpu * mm["eb"] / (gpu["bw"] * GPU_EFF) + GPU_RT_US * 1e-6)) if gpu and u_gpu else 0.0
     t_cold = (q["L"] * u_cold + promote_card + promote_gpu) * mm["eb"] / cpu_bw
-    t_pcie = q["L"] * (PCIE_RT_US * 1e-6 + 2 * m * q["d"] * 2 / (PCIE * PCIE_EFF))
+    t_pcie = q["L"] * 2 * m * q["d"] * 2 / (PCIE * PCIE_EFF)
+    t_ctl = t_control(m)
     # one draft token: the MTP layer (full attention, shared expert, router, hyper-connections, two d x d input
     # projections, draft head over the reduced vocabulary) on the card, its 10 routed experts on the CPU
     mtp_dense = (p["attn_full"] * b["full"] + 3 * q["d"] * q["S"] * b["shared"] + q["d"] * q["E"] * b["router"]
                  + p["hc"] / q["L"] * b["hc"] + (2 * q["d"] ** 2 + DRAFT_VOCAB * q["d"]) * b["lm_head"])
-    t_draft = mtp_dense / a + q["k"] * mm["eb"] / cpu_bw + PCIE_RT_US * 1e-6
-    t = t_dense + t_sync + max(t_hot, t_gpu, t_cold + t_pcie) + (m - 1) * t_draft
-    links = [t_pcie + promote_card * mm["eb"] / (PCIE * PCIE_EFF)]
+    # its control: 3 reads (routing, block choice, draft head) and one layer's calls (opcount: ~45)
+    t_draft = mtp_dense / a + q["k"] * mm["eb"] / cpu_bw + 3 * (PCIE_RT_US + AFTER_READ * DISPATCH_US) * 1e-6
+    t = t_dense + t_sync + t_ctl + max(t_hot, t_gpu, t_cold + t_pcie) + (m - 1) * t_draft
+    links = [t_ctl + t_pcie + promote_card * mm["eb"] / (PCIE * PCIE_EFF), host_busy(m) + (m - 1) * t_draft]
     if gpu:
         links.append(promote_gpu * mm["eb"] / (gpu["link"] * PCIE_EFF))
     return accepted / max([t] + links)
@@ -213,7 +237,8 @@ def report():
                        f"{'host RAM' if mm['ngram_in_ram'] else 'NVMe (mmap)'} |")
     out += ["\n### Decode speed, batch 1, 4k context, experts BFP4\n",
             f"Efficiencies: card {DEVICE['eff']:.0%} of 512 GB/s, DRAM {CPU_EFF:.0%} of peak, PCIe {PCIE_EFF:.0%}, "
-            f"{PCIE_RT_US:.0f} us round trip per layer. 'Card hit rate' = share of the 10 activated experts per layer found "
+            f"{PCIE_RT_US:.0f} us per host read ({READS(1)} per token) + {AFTER_READ} card calls after it at {DISPATCH_US:.0f} us "
+            f"(the host issues {DISPATCH(1)} calls per token, device/opcount.py). 'Card hit rate' = share of the 10 activated experts per layer found "
             "on the card. Uniform routing gives the share of experts that fit; a measured popularity profile (Basalt ships "
             "one) raises it. MTP speculative decoding is not included.\n",
             "| Host | Dense format | uniform routing | 60% hits | 80% hits | time split at uniform: dense / hot / cold+PCIe (ms) |",

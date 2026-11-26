@@ -96,7 +96,8 @@ class TP:
         A, B = self.A, self.B
         probs, ya = A.dense_mlp(L, x)
         top, gate = A.route(L, probs)
-        xb = self.to(B, x, A)
+        xh = A.o.get(x)
+        xb = B.o.put(xh)                               # through host memory, as self.to
         _, yb = B.dense_mlp(L, xb, router=False)
         es = sorted(set(top.ravel().tolist()))
         cold, hot = [], {A: [], B: []}
@@ -109,14 +110,13 @@ class TP:
             self.hits += n
             dev, local = self.slots[L, e]
             hot[dev].append((local, gate[:, e]))
-        if hot[A]:
-            ya = A.o.add(ya, A.slot_experts(x, hot[A]))
+        if hot[A]:                                     # both devices queue their experts; meanwhile the host runs
+            ya = A.o.add(ya, A.slot_experts(x, hot[A]))   # the cold ones (x is already on the host: xb was read for B)
         if hot[B]:
             yb = B.o.add(yb, B.slot_experts(xb, hot[B]))
+        yc = self.host.experts(L, xh, cold, gate[:, cold].T) if cold else None
         y = self.allreduce(ya, yb)
-        if cold:
-            y = A.o.add(y, A.o.put(self.host.experts(L, A.o.get(x), cold, gate[:, cold].T)))
-        return y
+        return A.o.add(y, A.o.put(yc)) if cold else y
 
     def layers(self, h4, tokens=()):
         A, B, c = self.A, self.B, self.c
