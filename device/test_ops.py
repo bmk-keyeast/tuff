@@ -1,4 +1,5 @@
-"""Run this first on the card: every operation of ops.TTNN against ops.Torch, then the card code end to end.
+"""Run this first on the card: every operation of ops.TTNN against ops.Torch, then the card code end to end
+(device/qfn.py with traces, on the tiny random QFN) against the CPU backend.
 
     python device/test_ops.py            # needs ttnn and a Tenstorrent device
 
@@ -75,9 +76,40 @@ def main():
             err, ok = repr(e)[:120], False
         bad += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {err if isinstance(err, str) else f'{err:.1e}'}")
-    ttnn.close_device(dev)
     print("all ops agree" if not bad else f"{bad} ops to fix in ops.TTNN")
+    if not bad:
+        bad += card_end_to_end(dev)
+    ttnn.close_device(dev)
     sys.exit(bad > 0)
+
+
+def card_end_to_end(dev, T=24):
+    """device/qfn.py on the card (ttnn, with traces) against the CPU backend on the tiny random QFN of test_qfn.py:
+    a prompt pass, single steps, then speculative decoding with QFN's MTP drafter."""
+    import qfn
+    from test_qfn import mtp_weights, tiny, weights
+    c = tiny()
+    w = weights(c)
+    ids = [int(t) for t in np.random.default_rng(1).integers(0, c.vocab_size, T)]
+    kw = dict(dense_fmt="bf16", expert_fmt="bfp8", slots=c.num_hidden_layers * c.num_experts // 3, budget=4)
+    out = {}
+    for name, ops in (("cpu", Torch()), ("card", TTNN(dev))):
+        card = qfn.Card(ops, w, c, qfn.Host(w, c), **kw)
+        rows = [ops.get(card.verify(ids[:12]))]
+        card.commit(12)
+        for t in ids[12:]:
+            rows.append(ops.get(card.step(t)))
+        out[name] = (np.concatenate(rows), card.routes)
+    (a, ra), (b, rb) = out["cpu"], out["card"]
+    err = (np.abs(b - a).max(1) / np.abs(a).max(1)).max()
+    same = np.mean([set(ra[k].tolist()) == set(rb[k].tolist()) for k in ra])
+    print(f"card code on the card vs CPU backend: {T} tokens, max relative error {err:.1e}, same experts {same:.1%}")
+    plain = qfn.Card(TTNN(dev), w, c, qfn.Host(w, c), **kw).generate(ids[:12], 16)
+    spec = qfn.Card(TTNN(dev), w, c, qfn.Host(w, c), **kw).generate(
+        ids[:12], 16, qfn.MTPDrafter(TTNN(dev), mtp_weights(c), c, qfn.Host(w, c), **kw), 2)
+    print(f"speculative greedy on the card == plain greedy on the card: {spec == plain} (bf16 activations can split "
+          f"near-ties between a 3-token verify and single steps; a few differing tokens is rounding, not a bug)")
+    return int(err > 0.1)
 
 
 if __name__ == "__main__":
