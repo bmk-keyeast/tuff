@@ -244,8 +244,14 @@ It is written in [`device/ops.py`](device/ops.py)'s operations, which have two b
   **First thing to run on the card**: [`device/test_ops.py`](device/test_ops.py) compares every TTNN operation with
   `Torch` and names the ones to fix.
 
-Not there yet: fused ops and traces for speed, the C host side (tcache, tstore, moe_forward_n) under the card code,
-and the 4060 Ti's half of the split.
+**The host side in C.** [`device/host_c.py`](device/host_c.py) runs the card code over `kernels/libtuff.so` (ctypes):
+cold experts come straight from the converted BFP4 files (tstore, memory-mapped) through one `moe_forward_n` call per
+layer and step, so an MTP verification reads each cold expert once per 4 tokens, and the card's slots are managed by
+tcache. [`device/test_host_c.py`](device/test_host_c.py) (CI) checks that it gives the same outputs as the numpy host on
+the same BFP4 numbers (1.4e-6), the same slot decisions (349 of 1,280 lookups hit, in both), and that speculative greedy
+decoding over it equals plain greedy decoding over it.
+
+Not there yet: fused ops and traces for speed on the card, and the 4060 Ti's half of the split.
 
 ## What exists
 
@@ -260,7 +266,8 @@ and the 4060 Ti's half of the split.
 | [`kernels/bfp_cuda.cu`](kernels/bfp_cuda.cu) | GEMV (1–4 tokens) and MoE layer on an NVIDIA GPU, same byte layout as the host; compiled in CI, not run yet |
 | [`tp_check.py`](tp_check.py) | The card/GPU tensor-parallel split is exact, on transformers' Qwen4Exp layer code |
 | [`ref.py`](ref.py) | QFN decode as a per-token recurrence in plain numpy, keyed by checkpoint names: DeltaNet conv window and state, KV cache with the QSA indexer, PLE n-gram hashing and dilated conv, hyper-connections, MoE. The spec for the device path; CI checks it against transformers' prefill on a tiny random model |
-| [`device/`](device) | The card code: `qfn.py` (decode step, card/host split, expert slots), `ops.py` (Torch and ttnn backends), `test_qfn.py` (== ref.py), `test_ops.py` (ttnn vs Torch, per operation, on the card) |
+| [`device/`](device) | The card code: `qfn.py` (decode and MTP verification, card/host split, expert slots, MTP drafter), `ops.py` (Torch and ttnn backends), `host_c.py` (the C host side via ctypes), `test_qfn.py` (== ref.py, speculative == greedy), `test_host_c.py` (C host == numpy host), `test_ops.py` (ttnn vs Torch, per operation, on the card) |
+| [`kernels/capi.c`](kernels/capi.c) | `libtuff.so`: tstore, tcache and `moe_forward_n` behind a small C API for the card code |
 | [`ref_real.py`](ref_real.py) | ref.py on the real checkpoint, streamed: routing vs transformers in all 48 layers, next-token loss, QFN's MTP draft acceptance → [`results/ref_real.md`](results/ref_real.md) |
 | [`kernels/tt_tile.c`](kernels/tt_tile.c) | Host panels → Tenstorrent `bfp4_b`/`bfp8_b` tiles of W^T (8×8 nibble transposes + byte table, 1.1 GB/s per core); CI compares it with a port of tt-metal's `pack_as_bfp_tiles` |
 | [`bench/host.sh`](bench/host.sh) | Measures the real host: DRAM read bandwidth, cold experts per thread count, MTP, the GPU → `results/host_*.md` |
@@ -313,6 +320,7 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] RTX 4060 Ti: decode model, exact tensor-parallel split (checked), CUDA kernels on the host layout (compiled)
 - [x] Host packing identical to tt-metal's; host → card tile conversion checked against tt-metal's packer
 - [x] Decode recurrence specified in numpy (`ref.py`), checked against transformers and on the real weights (100% routing)
+- [x] The card code runs over the C host side (libtuff.so: tstore + moe_forward_n, tcache), == the numpy host
 - [ ] Copy engine: background PCIe copies of promoted experts to the card and the GPU (pinned host memory)
 - [ ] Run `test_cuda` and `bench/host.sh` on the real box; replace GPU_EFF, CPU_EFF and the round-trip guesses
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages
@@ -367,6 +375,8 @@ reporting set to "OS First" in the BIOS.
   ttnn 백엔드는 카드 없이 tt-metal 소스를 보고 작성. DeltaNet은 ttnn에 이미 있는 전용 연산(`fused_recurrent_gated_delta_rule`) 사용
 - **MTP 추측 디코딩을 카드 코드에 구현**: 여러 토큰을 한 번에 검증하고(가중치 한 번 읽기), 거절된 토큰만큼 상태를 정확히 되돌림.
   QFN MTP 초안 모델도 카드 코드로 작성. 추측 디코딩 결과가 일반 greedy 생성과 토큰 단위로 완전히 같음을 확인
+- **호스트 쪽을 C로 연결**(`libtuff.so`): 놓친 전문가는 변환된 BFP4 파일을 mmap한 저장소에서 `moe_forward_n`으로 한 번에 계산,
+  카드 슬롯은 C 캐시(`tcache`)가 관리. numpy 호스트와 결과·슬롯 판단이 같음을 CI에서 확인
 
 **다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 
