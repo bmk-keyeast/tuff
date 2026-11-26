@@ -10,6 +10,10 @@ Parameters (this count): main model 125.7B (published: ~125B), active per token 
 | E5-2690v4, 4x16GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | no: rarely used experts on NVMe | NVMe (mmap) |
 | E5-2690v4, 128GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | yes | host RAM |
 | E5-2690v4, 128GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | yes | host RAM |
+| E5-2696v4, DDR3 8x16GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | yes | host RAM |
+| E5-2696v4, DDR3 8x16GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | yes | host RAM |
+| Gold 6138, 6x32GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | yes | host RAM |
+| Gold 6138, 6x32GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | yes | host RAM |
 | 8259CL, 6x32GB | bfp8, 4.6 GB | 9,802 / 24,576 (40%) | 43.5 GB | yes | yes | host RAM |
 | 8259CL, 6x32GB | bfp4, 2.4 GB | 10,580 / 24,576 (43%) | 41.4 GB | yes | yes | host RAM |
 
@@ -23,5 +27,9 @@ Efficiencies: card 43% of 512 GB/s, DRAM 70% of peak, PCIe 80%, 30 us per host r
 | E5-2690v4, 4x16GB | bfp4 | 32.5 t/s | 38.2 | 48.5 | 11.7 / 2.6 / 19.0 |
 | E5-2690v4, 128GB | bfp8 | 24.2 t/s | 27.8 | 32.9 | 21.5 / 2.4 / 19.9 |
 | E5-2690v4, 128GB | bfp4 | 32.5 t/s | 38.2 | 48.5 | 11.7 / 2.6 / 19.0 |
+| E5-2696v4, DDR3 8x16GB | bfp8 | 21.3 t/s | 25.2 | 31.0 | 21.5 / 2.4 / 25.4 |
+| E5-2696v4, DDR3 8x16GB | bfp4 | 27.8 t/s | 33.5 | 44.5 | 11.7 / 2.6 / 24.2 |
+| Gold 6138, 6x32GB | bfp8 | 29.7 t/s | 32.5 | 33.8 | 21.5 / 2.4 / 12.2 |
+| Gold 6138, 6x32GB | bfp4 | 42.7 t/s | 47.6 | 50.4 | 11.7 / 2.6 / 11.7 |
 | 8259CL, 6x32GB | bfp8 | 30.4 t/s | 33.1 | 33.8 | 21.5 / 2.4 / 11.4 |
 | 8259CL, 6x32GB | bfp4 | 44.1 t/s | 48.9 | 50.4 | 11.7 / 2.6 / 10.9 |

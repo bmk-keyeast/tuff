@@ -70,6 +70,11 @@ HOSTS = {
     # Xeon E5-2690 v4: 14C/28T Broadwell-EP, AVX2+FMA, 4 x DDR4-2133 ECC RDIMM (4 channels), PCIe 3.0 x16
     "E5-2690v4, 4x16GB": dict(ram=64 * GiB, bw=4 * 2133e6 * 8),
     "E5-2690v4, 128GB": dict(ram=128 * GiB, bw=4 * 2133e6 * 8),
+    # Xeon E5-2696 v4 (22C Broadwell-EP) on an X99 board that takes DDR3 ECC RDIMMs: 8 x 16 GB = 2 per channel on 4
+    # channels; assumed to run DDR3-1600 (many boards drop to 1333 with 2 RDIMMs per channel: 43 GB/s)
+    "E5-2696v4, DDR3 8x16GB": dict(ram=128 * GiB, bw=4 * 1600e6 * 8),
+    # Xeon Gold 6138 (20C Skylake-SP, AVX-512): 6 x DDR4-2666, PCIe 3.0; capacity assumed 6 x 32 GB
+    "Gold 6138, 6x32GB": dict(ram=192 * GiB, bw=6 * 2666e6 * 8),
     # Xeon Platinum 8259CL (LGA3647): 24C Cascade Lake, AVX-512 VNNI, 6 x DDR4-2933, still PCIe 3.0.
     # Capacity is an assumption (6 x 32 GB).
     "8259CL, 6x32GB": dict(ram=192 * GiB, bw=6 * 2933e6 * 8),

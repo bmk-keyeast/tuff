@@ -457,7 +457,7 @@ def analyze(prof=None):
                 "assumes Basalt's measured draft lengths and acceptance (community medians), with each step's experts "
                 "interpolated from the table above and split by that hit rate. Batch 1, 4k context.\n",
                 "| Host | Dense on card | Hit rate | no MTP | " + " | ".join(scen) + " |", "|---|---|---:|---:|" + "---:|" * len(scen)]
-        for hn in ("E5-2690v4, 4x16GB", "8259CL, 6x32GB"):
+        for hn in ("E5-2690v4, 4x16GB", "E5-2696v4, DDR3 8x16GB", "Gold 6138, 6x32GB", "8259CL, 6x32GB"):
             hh = plan.HOSTS[hn]
             for d, spec in dense_rows.items():
                 hr, cp = simulate_cache(mix, cap(spec), 25, b, L * E)
