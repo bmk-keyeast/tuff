@@ -3,7 +3,7 @@
     make -C kernels libtuff.so
     python loader.py convert <snapshot> <store> --fmt bfp4      # the experts as BFP4 files, once
     python device/test_ops.py                                     # first: every ttnn op against the CPU backend
-    python device/run.py --model <snapshot> --store <store> --prompt "..." [--n 128] [--mtp 2] [--cpu]
+    python device/run.py --model <snapshot> --store <store> --prompt "..." [--n 128] [--mtp 2] [--gpu] [--cpu]
 
 <snapshot>: a local Hugging Face snapshot of Qwen/Qwen3.8-Flash-Next (config, tokenizer, safetensors). --cpu runs the
 same code on ops.Torch (very slow on the full model; for checking the setup). Prints the text, tokens/s, steps and
@@ -62,6 +62,7 @@ def main():
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--trace-mb", type=int, default=256, help="trace region (raise it if capture says so)")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--gpu", action="store_true", help="split the dense part with an NVIDIA GPU (device/tp.py)")
     a = ap.parse_args()
 
     from transformers import AutoConfig, AutoTokenizer
@@ -82,7 +83,14 @@ def main():
         from ops import TTNN
         ops = TTNN(ttnn.open_device(device_id=0, trace_region_size=a.trace_mb << 20))
     kw = dict(dense_fmt=DENSE, expert_fmt="bfp4", max_t=a.ctx)
-    card = qfn.Card(ops, W, cfg, host, slots=n_slots, cache=host_c.CCache(n_slots, 25, L, E, so=so), **kw)
+    if a.gpu:                                          # the 4060 Ti: its share of every head and row, its own slots
+        import tp
+        from ops import CUDA
+        sp = plan.split_multi(plan.GPUS["RTX 4060 Ti 16GB"], DENSE, "bfp4", a.ctx)
+        cache = host_c.CCache(sp["n_card"], 25, L, E, so=so, n_other=sp["n_gpu"])
+        card = tp.TP(ops, CUDA(), W, cfg, host, f=sp["f"], n_card=sp["n_card"], n_gpu=sp["n_gpu"], cache=cache, **kw)
+    else:
+        card = qfn.Card(ops, W, cfg, host, slots=n_slots, cache=host_c.CCache(n_slots, 25, L, E, so=so), **kw)
     drafter = None
     if a.mtp:
         import copy

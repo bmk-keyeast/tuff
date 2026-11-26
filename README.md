@@ -307,10 +307,15 @@ make -C kernels libtuff.so
 python loader.py convert /path/to/snapshot experts/ --fmt bfp4
 python device/test_ops.py                                   # every ttnn op against the CPU backend, first
 python device/run.py --model /path/to/snapshot --store experts/ --prompt "..." --n 128 --mtp 2
+make -C kernels libtuff_cuda.so && python device/test_cuda_ops.py   # with the 4060 Ti
+python device/run.py --model /path/to/snapshot --store experts/ --prompt "..." --gpu
 ```
 
-Not there yet: a CUDA backend for ops.py (the GPU side runs on the
-Torch backend; with torch on CUDA it is the same code).
+**The 4060 Ti's backend.** [`ops.CUDA`](device/ops.py) keeps BFP weights as BFP in GPU memory, in the host layout
+that `tstore` maps, and multiplies with [`kernels/bfp_cuda.cu`](kernels/bfp_cuda.cu) (`make -C kernels
+libtuff_cuda.so`, compiled in CI); everything else is torch on CUDA. `device/run.py --gpu` splits the dense part with it
+(`plan.split_multi`'s share) and gives it its share of the expert slots; [`device/test_cuda_ops.py`](device/test_cuda_ops.py)
+checks it against the CPU backend on the box. Not run yet (no GPU in CI).
 
 ## What exists
 
@@ -328,6 +333,7 @@ Torch backend; with torch on CUDA it is the same code).
 | [`device/`](device) | The card code: `qfn.py` (decode and MTP verification, card/host split, expert slots, MTP drafter), `ops.py` (Torch and ttnn backends), `host_c.py` (the C host side via ctypes), `test_qfn.py` (== ref.py, speculative == greedy), `test_host_c.py` (C host == numpy host), `test_ops.py` (ttnn vs Torch, per operation, on the card) |
 | [`device/run.py`](device/run.py) | Decode on the card end to end: real checkpoint, ttnn, libtuff, MTP drafts; prints t/s |
 | [`device/opcount.py`](device/opcount.py) | Card calls, host reads and writes, trace replays per pass, scaled to QFN → [`results/opcount.md`](results/opcount.md) |
+| [`device/test_cuda_ops.py`](device/test_cuda_ops.py) | On the box with the 4060 Ti: `ops.CUDA` against the CPU backend, then the split with the GPU side on CUDA |
 | [`device/tp.py`](device/tp.py) | The p150a and a 4060 Ti together: the dense part split (tensor parallel), one expert cache over both devices' slots, partial sums through the host; `test_tp.py` checks it against one device |
 | [`kernels/capi.c`](kernels/capi.c) | `libtuff.so`: tstore, tcache and `moe_forward_n` behind a small C API for the card code |
 | [`ref_real.py`](ref_real.py) | ref.py on the real checkpoint, streamed: routing vs transformers in all 48 layers, next-token loss, QFN's MTP draft acceptance → [`results/ref_real.md`](results/ref_real.md) |
@@ -384,6 +390,7 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Decode recurrence specified in numpy (`ref.py`), checked against transformers and on the real weights (100% routing)
 - [x] The card code runs over the C host side (libtuff.so: tstore + moe_forward_n, tcache), == the numpy host
 - [x] Card + 4060 Ti split in the card code (tensor parallel, shared expert cache), == one device
+- [x] The 4060 Ti's backend: BFP weights through `bfp_cuda.cu` from Python (`ops.CUDA`), `run.py --gpu`; not run yet
 - [ ] Copy engine: background PCIe copies of promoted experts to the card and the GPU (pinned host memory)
 - [ ] Run `test_cuda` and `bench/host.sh` on the real box; replace GPU_EFF, CPU_EFF and the round-trip guesses
 - [ ] Measure on the real host: STREAM, `bench_bfp` with 14 threads, NUMA and hugepages

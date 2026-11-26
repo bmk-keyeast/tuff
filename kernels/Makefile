@@ -30,11 +30,15 @@ bfp_host.o: bfp.c bfp.h
 test_cuda: test_cuda.cu bfp_cuda.cu bfp_cuda.h bfp_host.o
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -Xcompiler -fopenmp test_cuda.cu bfp_cuda.cu bfp_host.o -o $@ -lgomp -lm
 
+# the GPU side for the Python card code (ops.CUDA)
+libtuff_cuda.so: bfp_cuda.cu bfp_cuda.h
+	$(NVCC) -O3 -arch=$(CUDA_ARCH) -shared -Xcompiler -fPIC bfp_cuda.cu -o $@
+
 test: test_bfp test_cache test_store
 	OMP_NUM_THREADS=4 ./test_bfp
 	./test_cache
 
 clean:
-	rm -f test_bfp test_cache test_store bench_bfp test_cuda bfp_host.o libtuff.so
+	rm -f test_bfp test_cache test_store bench_bfp test_cuda bfp_host.o libtuff.so libtuff_cuda.so
 
 .PHONY: all test clean

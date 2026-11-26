@@ -4,6 +4,9 @@
                      device/qfn.py on it against ref.py, so the model code is checked before there is a card.
     TTNN(device)     the same operations on a Tenstorrent card through ttnn. Not run yet (no card).
                      device/test_ops.py compares every operation with Torch() on the card; run it first.
+    CUDA()           an NVIDIA GPU (the 4060 Ti next to the card, device/tp.py): BFP weights stay BFP in GPU memory
+                     and go through kernels/bfp_cuda.cu (libtuff_cuda.so); the rest is torch on CUDA. Not run yet
+                     (no GPU in CI); device/test_cuda_ops.py checks it against Torch() on the box.
 
 Tensors are 2-D [rows, cols] unless an operation says otherwise. A weight W [out, in] (torch layout) is uploaded as
 W^T [in, out], so linear(x, w) = x @ W^T, and a BFP block (16 consecutive outputs of one input) is a TT face row.
@@ -144,11 +147,11 @@ class Torch:
         """k largest of each row of a [m, n], ties to the lowest index (as ttnn.topk(stable=True)); returns (values
         [m, k] on the card, indices [m, k] on the host)."""
         self._host()
-        idx = np.argsort(-a.numpy(), axis=1, kind="stable")[:, :k]
-        return self.t.gather(a, 1, self.t.from_numpy(idx)), idx
+        idx = np.argsort(-a.detach().cpu().numpy(), axis=1, kind="stable")[:, :k]
+        return self.t.gather(a, 1, self.t.from_numpy(idx).to(a.device)), idx
 
     def gather_rows(self, table, idx):
-        return table[self.t.as_tensor(np.asarray(idx, np.int64))]
+        return table[self.t.as_tensor(idx, device=table.device)]
 
     def write_rows(self, table, i, rows):
         table[i:i + rows.shape[0]] = rows
@@ -316,3 +319,72 @@ class TTNN:
             tt.reshape(g, (1, m, HV)), tt.reshape(beta, (1, m, HV)), scale=scale,
             initial_state=tt.reshape(state, (1, HV, K, V)), output_per_token_state=per_token)
         return tt.reshape(o, (m, HV, V)), tt.reshape(s, (m if per_token else 1, HV, K, V))
+
+
+class Packed:
+    """A BFP weight in GPU memory in the host layout of kernels/bfp.h (what tstore maps): W [out, in]"""
+
+    def __init__(self, exp, mant, out, n, mb):
+        self.exp, self.mant, self.out, self.n, self.mb = exp, mant, out, n, mb
+        self.shape = (n, out)                            # as the W^T a put_weight returns elsewhere
+
+
+class CUDA(Torch):
+    def __init__(self, so=None, device="cuda"):
+        import ctypes
+        from pathlib import Path
+        super().__init__()
+        self.cuda, self.c = device, ctypes
+        self.lib = ctypes.CDLL(str(so or Path(__file__).resolve().parent.parent / "kernels" / "libtuff_cuda.so"))
+        self.lib.tgpu_gemv.restype = ctypes.c_int
+
+        class Job(ctypes.Structure):
+            _fields_ = [("exp", ctypes.c_void_p), ("mant", ctypes.c_void_p), ("x", ctypes.c_void_p),
+                        ("y", ctypes.c_void_p), ("out", ctypes.c_int), ("inn", ctypes.c_int), ("ldx", ctypes.c_int),
+                        ("ldy", ctypes.c_int)]
+        self.Job = Job
+
+    def put(self, a, fmt="f32"):
+        return super().put(a, fmt).to(self.cuda)
+
+    def put_ids(self, ids, dtype="uint32"):
+        return super().put_ids(ids, dtype).to(self.cuda)
+
+    def zeros(self, shape):
+        return super().zeros(shape).to(self.cuda)
+
+    def get(self, x):
+        self._host()
+        return x.detach().float().cpu().numpy().astype(np.float64)
+
+    def put_weight(self, w, fmt):
+        import loader
+        w = np.asarray(w, np.float32)
+        if fmt in ("bfp8", "bfp4") and not (w.shape[0] % 16 or w.shape[1] % 8):
+            e, m = loader.pack(w, fmt)
+            up = lambda b: self.t.frombuffer(bytearray(b), dtype=self.t.uint8).to(self.cuda)
+            return Packed(up(e), up(m), w.shape[0], w.shape[1], loader.MBITS[fmt])
+        return super().put_weight(w, fmt).to(self.cuda)
+
+    def linear(self, x, w, act=None):
+        if not isinstance(w, Packed):
+            return super().linear(x, w, act)
+        x = x.contiguous().float()
+        lead, (m, n) = x.shape[:-1], (int(np.prod(x.shape[:-1])), x.shape[-1])
+        y = self.t.empty((m, w.out), device=self.cuda)
+        stream = self.t.cuda.current_stream().cuda_stream
+        for t0 in range(0, m, 4):                          # tgpu_gemv: up to 4 tokens per launch
+            j = self.Job(w.exp.data_ptr(), w.mant.data_ptr(), x.data_ptr() + 4 * t0 * n, y.data_ptr() + 4 * t0 * w.out,
+                         w.out, n, n, w.out)
+            err = self.lib.tgpu_gemv(w.mb, self.c.byref(j), 1, min(4, m - t0), self.c.c_void_p(stream))
+            if err:
+                raise RuntimeError(f"tgpu_gemv: cudaError {err}")
+        y = y.reshape(*lead, w.out)
+        return y if act is None else getattr(self, act)(y)
+
+    def gather_matmul(self, x, bank, ids, act=None):
+        # ponytail: one gemv per chosen slot; tgpu_moe does a whole layer in one launch once the banks are its tables
+        g = x.shape[0]
+        ys = [self.linear(x[i if g > 1 else 0], bank["w"][int(s)]) for i, s in enumerate(ids.tolist())]
+        y = self.t.stack(ys)
+        return y if act is None else getattr(self, act)(y)
