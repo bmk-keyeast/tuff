@@ -27,6 +27,7 @@ Caches and banks are updated in place, so segments read them by address.
 """
 import math
 import sys
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -555,6 +556,7 @@ class Card:
             if drafter:
                 drafter.catch_up(self, i, len(chunk))
         nxt = int(self.lm_argmax(mixed)[-1])
+        self.t_prompt = time.perf_counter()            # the prompt is in (device/run.py times decoding from here)
         out, self.steps = [], 0
         while len(out) < n:
             drafts = drafter.propose(self, nxt, k) if drafter else []

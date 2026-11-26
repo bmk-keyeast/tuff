@@ -298,6 +298,17 @@ matmul ([`attention_all`](device/qfn.py)). DeltaNet keeps only the last state of
 to roll back a speculative verify, would take m × 3 MiB per layer). `test_qfn.py` checks a prompt in two long passes
 (the second starting mid-block) and prompts chunked under a drafter against ref.py / plain greedy.
 
+**Running it on the card.** [`device/run.py`](device/run.py) puts it together: the real checkpoint from a local
+snapshot (dense weights uploaded once, experts read per slot), the card through ttnn, the C host side for cold
+experts and the cache, QFN's MTP drafter; it prints the text, tokens/s, steps and the card hit rate.
+
+```bash
+make -C kernels libtuff.so
+python loader.py convert /path/to/snapshot experts/ --fmt bfp4
+python device/test_ops.py                                   # every ttnn op against the CPU backend, first
+python device/run.py --model /path/to/snapshot --store experts/ --prompt "..." --n 128 --mtp 2
+```
+
 Not there yet: a CUDA backend for ops.py (the GPU side runs on the
 Torch backend; with torch on CUDA it is the same code).
 
@@ -315,6 +326,8 @@ Torch backend; with torch on CUDA it is the same code).
 | [`tp_check.py`](tp_check.py) | The card/GPU tensor-parallel split is exact, on transformers' Qwen4Exp layer code |
 | [`ref.py`](ref.py) | QFN decode as a per-token recurrence in plain numpy, keyed by checkpoint names: DeltaNet conv window and state, KV cache with the QSA indexer, PLE n-gram hashing and dilated conv, hyper-connections, MoE. The spec for the device path; CI checks it against transformers' prefill on a tiny random model |
 | [`device/`](device) | The card code: `qfn.py` (decode and MTP verification, card/host split, expert slots, MTP drafter), `ops.py` (Torch and ttnn backends), `host_c.py` (the C host side via ctypes), `test_qfn.py` (== ref.py, speculative == greedy), `test_host_c.py` (C host == numpy host), `test_ops.py` (ttnn vs Torch, per operation, on the card) |
+| [`device/run.py`](device/run.py) | Decode on the card end to end: real checkpoint, ttnn, libtuff, MTP drafts; prints t/s |
+| [`device/opcount.py`](device/opcount.py) | Card calls, host reads and writes, trace replays per pass, scaled to QFN → [`results/opcount.md`](results/opcount.md) |
 | [`device/tp.py`](device/tp.py) | The p150a and a 4060 Ti together: the dense part split (tensor parallel), one expert cache over both devices' slots, partial sums through the host; `test_tp.py` checks it against one device |
 | [`kernels/capi.c`](kernels/capi.c) | `libtuff.so`: tstore, tcache and `moe_forward_n` behind a small C API for the card code |
 | [`ref_real.py`](ref_real.py) | ref.py on the real checkpoint, streamed: routing vs transformers in all 48 layers, next-token loss, QFN's MTP draft acceptance → [`results/ref_real.md`](results/ref_real.md) |
@@ -438,7 +451,7 @@ reporting set to "OS First" in the BIOS.
 - **프롬프트 처리(prefill)**: 512토큰씩 한 번에. 어텐션은 마스크로 모든 토큰을 한 번에 계산하고, DeltaNet은 마지막 상태만
   남겨 메모리를 아낌(토큰별 상태는 512토큰이면 층마다 1.5GB). 결과가 ref.py와 같음을 확인
 
-**다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
+**다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고, `device/run.py`로 실제 생성·속도 측정, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 
 ## License
 
