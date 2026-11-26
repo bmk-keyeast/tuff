@@ -94,11 +94,12 @@ class TP:
 
     def moe(self, L, x):
         A, B = self.A, self.B
-        top, gate = A.route(L, x)
+        probs, ya = A.dense_mlp(L, x)
+        top, gate = A.route(L, probs)
         xb = self.to(B, x, A)
-        ya, yb = A.shared(L, x), B.shared(L, xb)
+        _, yb = B.dense_mlp(L, xb, router=False)
         es = sorted(set(top.ravel().tolist()))
-        cold = []
+        cold, hot = [], {A: [], B: []}
         for e, slot in zip(es, self.cache.lookup([(L, e) for e in es])):
             n = int((gate[:, e] > 0).sum())
             self.lookups += n
@@ -106,11 +107,12 @@ class TP:
                 cold.append(e)
                 continue
             self.hits += n
-            dev, (gu, dn) = self.slots[L, e]
-            if dev is A:
-                ya = A.o.add(ya, A.expert(x, gu, dn, gate[:, e:e + 1]))
-            else:
-                yb = B.o.add(yb, B.expert(xb, gu, dn, gate[:, e:e + 1]))
+            dev, ws = self.slots[L, e]
+            hot[dev].append((*ws, gate[:, e]))
+        if hot[A]:
+            ya = A.o.add(ya, A.slot_experts(x, hot[A]))
+        if hot[B]:
+            yb = B.o.add(yb, B.slot_experts(xb, hot[B]))
         y = self.allreduce(ya, yb)
         if cold:
             y = A.o.add(y, A.o.put(self.host.experts(L, A.o.get(x), cold, gate[:, cold].T)))

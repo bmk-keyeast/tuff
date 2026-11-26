@@ -13,8 +13,13 @@ the tokens in order. Card.commit(j) then keeps the first j tokens: DeltaNet's pe
 the cache positions roll back to exactly that point. generate() does greedy speculative decoding with it, and must
 emit exactly the tokens plain greedy decoding emits (device/test_qfn.py checks this).
 
-ponytail: everything through ops.py's generic operations; fused ttnn ops, traces and the C host side (tcache, tstore,
-moe_forward_n) come in once the card runs this.
+Speed (device/opcount.py counts it): weights that read the same input are stacked into one linear per format (lins),
+RMSNorm is one op, RoPE's rotation one matmul, the routed experts' gate weights are applied in one go, and each
+DeltaNet layer's dense part (hyper-connection read, DeltaNet, the MLP's hyper-connection read, router, shared expert)
+runs as a traced segment (ops.trace): replayed from the card's trace buffer, with no Python dispatch, whenever a pass
+has m <= `trace` tokens.
+Attention layers trace their two dense ends; ponytail: the per-token core between them stays eager (the
+indexer's block choice goes through the host per token).
 """
 import math
 import sys
@@ -95,8 +100,8 @@ class PyCache:
 
 class Card:
     def __init__(self, ops, w, cfg, host, dense_fmt="bfp8", expert_fmt="bfp4", slots=10_000, budget=25, max_t=4096,
-                 cache=None):
-        self.o, self.w, self.c, self.host = ops, w, cfg, host
+                 cache=None, trace=8):
+        self.o, self.w, self.c, self.host, self.trace = ops, w, cfg, host, trace
         self.cache = cache or PyCache(slots, budget)
         self.dense_fmt, self.expert_fmt, self.max_t = dense_fmt, expert_fmt, max_t
         c = cfg
@@ -121,6 +126,27 @@ class Card:
         if name not in self.dev:
             self.dev[name] = self.o.put_weight(self.w[name + ".weight"], self.fmt(name))
         return self.dev[name]
+
+    def lins(self, x, names):
+        """x through several weights that read the same input: their rows stacked into one linear per format (one
+        weight read, one dispatch), the output split back. -> [x @ W^T for each name]"""
+        key = ("lins",) + tuple(names)
+        if key not in self.dev:
+            groups = {}
+            for n in names:
+                W, f = np.asarray(self.w[n + ".weight"], np.float32), self.fmt(n)
+                if f in ("bfp8", "bfp4") and (W.shape[0] % 16 or W.shape[1] % 8):
+                    f = "bf16"                          # put_weight falls back to bf16 for it alone, too
+                groups.setdefault(f, []).append((n, W))
+            self.dev[key] = [(self.o.put_weight(np.concatenate([W for _, W in g]), f), [(n, W.shape[0]) for n, W in g])
+                             for f, g in groups.items()]
+        out = {}
+        for w, parts in self.dev[key]:
+            y, i = self.o.linear(x, w), 0
+            for n, r in parts:
+                out[n] = y if len(parts) == 1 else self.o.slice(y, 1, i, i + r)
+                i += r
+        return [out[n] for n in names]
 
     def norm(self, name, plus_one=True, rows=1):
         """Qwen4ExpTextRMSNorm multiplies by (1 + w); the DeltaNet's gated norm by w. rows > 1: a per-stream norm's
@@ -152,8 +178,7 @@ class Card:
 
     # ---- building blocks (x: [m, ...], one row per token)
     def rms(self, x, w):
-        o = self.o
-        return o.mul(o.mul(x, o.rsqrt(o.add(o.mean(o.mul(x, x), -1), self.eps))), w)
+        return self.o.rms_norm(x, w, self.eps)
 
     def rope(self, x, pos):
         """x [rows, D] of one token at RoPE position pos; partial rotary on the first rd features."""
@@ -161,21 +186,21 @@ class Card:
         f = pos * self.inv_freq
         cos = self.const(("cos", pos), lambda: np.concatenate([np.cos(f)] * 2)[None])
         sin = self.const(("sin", pos), lambda: np.concatenate([np.sin(f)] * 2)[None])
-        r = o.slice(x, 1, 0, rd)
-        rot = o.concat([o.scale(o.slice(r, 1, half, rd), -1), o.slice(r, 1, 0, half)], 1)
-        y = o.add(o.mul(r, cos), o.mul(rot, sin))
+        P = self.const("rot", lambda: np.block([[np.zeros((half, half)), np.eye(half)], [-np.eye(half), np.zeros((half, half))]]))
+        r = o.slice(x, 1, 0, rd) if x.shape[1] > rd else x
+        y = o.add(o.mul(r, cos), o.mul(o.matmul(r, P), sin))           # r @ P = [-r2, r1]
         return o.concat([y, o.slice(x, 1, rd, x.shape[1])], 1) if x.shape[1] > rd else y
 
     def hc_read(self, p, h4, combine=True):
         o, hc, d, m = self.o, self.hc, self.d, h4.shape[0]
         hn = self.rms(o.reshape(h4, (m, hc, d)), self.norm(p + ".hc_norm.weight", rows=hc))      # [m, hc, d]
         flat = o.reshape(hn, (m, hc * d))
-        mix = o.sigmoid(o.linear(o.silu(o.scale(o.linear(flat, self.lin(p + ".input_mix_weight_down")), 1 / hc)),
-                                 self.lin(p + ".input_mix_weight_up")))
+        down, *inj = self.lins(flat, [p + ".input_mix_weight_down"] + ([p + ".block_inject_weight"] if combine else []))
+        mix = o.sigmoid(o.linear(o.silu(o.scale(down, 1 / hc)), self.lin(p + ".input_mix_weight_up")))
         mixed = o.reshape(o.mean(o.mul(o.reshape(mix, (m, hc, d)), hn), 1), (m, d))
         if not combine:
             return mixed
-        return mixed, o.scale(o.sigmoid(o.scale(o.linear(flat, self.lin(p + ".block_inject_weight")), 1 / hc)), 2)
+        return mixed, o.scale(o.sigmoid(o.scale(inj[0], 1 / hc)), 2)
 
     def hc_write(self, h4, inj, out):
         o, m = self.o, h4.shape[0]
@@ -184,39 +209,42 @@ class Card:
 
     # ---- Gated DeltaNet: conv window and recurrent state stay on the card
     def deltanet(self, L, x):
-        o, c, s, p = self.o, self.c, self.state[L], f"layers.{L}.linear_attn"
+        out, win, states = self.deltanet_core(L, x, self.state[L]["conv"], self.state[L]["S"])
+        self.pending[L] = dict(win=win, states=states)
+        return out
+
+    def deltanet_core(self, L, x, conv, S):
+        """-> (output [m, d], conv window, per-token states); no side effects (it runs inside a trace)"""
+        o, c, p = self.o, self.c, f"layers.{L}.linear_attn"
         K, V, dk, dv = c.linear_num_key_heads, c.linear_num_value_heads, c.linear_key_head_dim, c.linear_value_head_dim
         m, kern = x.shape[0], c.linear_conv_kernel_dim
-        qkv = o.linear(x, self.lin(p + ".in_proj_qkv"))                                # [m, C]
-        win = o.concat([s["conv"], qkv], 0)                                            # [kern - 1 + m, C], oldest first
+        qkv, z, a, b = self.lins(x, [p + ".in_proj_qkv", p + ".in_proj_z", p + ".in_proj_a", p + ".in_proj_b"])
+        win = o.concat([conv, qkv], 0)                                                 # [kern - 1 + m, C], oldest first
         cw = self.const(p + ".conv", lambda: np.asarray(self.w[p + ".conv1d.weight"], np.float64)[:, 0, :].T)
         qkv = o.silu(o.concat([o.sum(o.mul(o.slice(win, 0, i, i + kern), cw), 0) for i in range(m)], 0))
         l2 = lambda t: o.mul(t, o.rsqrt(o.add(o.sum(o.mul(t, t), -1), 1e-6)))
         q = l2(o.reshape(o.slice(qkv, 1, 0, K * dk), (m, K, dk)))
         k = l2(o.reshape(o.slice(qkv, 1, K * dk, 2 * K * dk), (m, K, dk)))
         v = o.reshape(o.slice(qkv, 1, 2 * K * dk, qkv.shape[1]), (m, V, dv))
-        z = o.reshape(o.linear(x, self.lin(p + ".in_proj_z")), (m, V, dv))
-        beta = o.sigmoid(o.linear(x, self.lin(p + ".in_proj_b")))
+        z = o.reshape(z, (m, V, dv))
+        beta = o.sigmoid(b)
         negA = self.const(p + ".negA", lambda: -np.exp(np.asarray(self.w[p + ".A_log"], np.float64))[None])
         dtb = self.const(p + ".dt_bias", lambda: np.asarray(self.w[p + ".dt_bias"], np.float64)[None])
-        g = o.mul(negA, o.softplus(o.add(o.linear(x, self.lin(p + ".in_proj_a")), dtb)))
-        out, states = o.gdr(q, k, v, g, beta, s["S"], dk ** -0.5)
-        self.pending[L] = dict(win=win, states=states)
+        g = o.mul(negA, o.softplus(o.add(a, dtb)))
+        out, states = o.gdr(q, k, v, g, beta, S, dk ** -0.5)
         gate = o.sigmoid(z) if self.gated_act else o.silu(z)
         out = o.mul(self.rms(out, self.norm(p + ".norm.weight", plus_one=False)), gate)
-        return o.linear(o.reshape(out, (m, V * dv)), self.lin(p + ".out_proj"))
+        return o.linear(o.reshape(out, (m, V * dv)), self.lin(p + ".out_proj")), win, states
 
     # ---- full attention with the QSA indexer; rows past the commit point are simply written again later
-    def attention(self, L, x):
+    def attention(self, L, x, proj=None):
+        """proj: the four projections of x, when a traced segment already computed them"""
         o, c, s, p = self.o, self.c, self.state[L], f"layers.{L}.self_attn"
         m, t0 = x.shape[0], self.t
         H, KV, hd = c.num_attention_heads, c.num_key_value_heads, c.head_dim
         nh, ihd, ratio = c.indexer_n_heads, c.indexer_head_dim, c.indexer_compress_ratio
-        qk = o.linear(x, self.lin(p + ".indexer.index_qk_proj"))
+        qk, qg, kk, vv = proj or self.attn_proj(L, x)
         s["idx"] = o.write_rows(s["idx"], t0, o.slice(qk, 1, nh * ihd, nh * ihd + ihd))      # raw keys
-        qg = o.linear(x, self.lin(p + ".q_proj"))
-        kk = o.linear(x, self.lin(p + ".k_proj"))
-        vv = o.linear(x, self.lin(p + ".v_proj"))
         s["V"] = o.write_rows(s["V"], t0, vv)
         G, outs = H // KV, []
         for i in range(m):
@@ -249,55 +277,69 @@ class Card:
                               o.sigmoid(o.reshape(o.slice(qi, 1, hd, 2 * hd), (1, H * hd)))))
         return o.linear(o.concat(outs, 0), self.lin(p + ".o_proj"))
 
+    def attn_proj(self, L, x):
+        p = f"layers.{L}.self_attn"
+        return self.lins(x, [p + ".indexer.index_qk_proj", p + ".q_proj", p + ".k_proj", p + ".v_proj"])
+
     # ---- MoE: router on the card; slot experts on the card (each read once for all m rows), the rest on the host
     def upload(self, L, e):
         # ponytail: from the float weights; on the card this is tstore_expert_tt's tiles, copied as they are
-        p = f"layers.{L}.mlp.experts."
+        # gate and up as two weights, so the gate's SiLU rides on its matmul (linear(..., act="silu"))
+        p, I = f"layers.{L}.mlp.experts.", self.c.moe_intermediate_size
         gu, dn = np.asarray(self.w[p + "gate_up_proj"][e]), np.asarray(self.w[p + "down_proj"][e])
-        return self.o.put_weight(gu, self.expert_fmt), self.o.put_weight(dn, self.expert_fmt)
+        return tuple(self.o.put_weight(a, self.expert_fmt) for a in (gu[:I], gu[I:], dn))
 
-    def moe(self, L, x):
+    def moe(self, L, x, dense=None):
+        """dense: (router probabilities, shared expert output) when a trace already computed them"""
         o = self.o
-        top, gate = self.route(L, x)                    # gate[i, e]: token i's weight on expert e
-        y = self.shared(L, x)
+        probs, y = dense or self.dense_mlp(L, x)
+        top, gate = self.route(L, probs)               # gate[i, e]: token i's weight on expert e
         es = sorted(set(top.ravel().tolist()))
-        cold = []
+        cold, hot = [], []
         for e, slot in zip(es, self.cache.lookup([(L, e) for e in es])):
             n = int((gate[:, e] > 0).sum())
             self.lookups += n
             if slot >= 0:
                 self.hits += n
-                y = o.add(y, self.expert(x, *self.slots[L, e], gate[:, e:e + 1]))
+                hot.append((*self.slots[L, e], gate[:, e]))
             else:
                 cold.append(e)
+        if hot:
+            y = o.add(y, self.slot_experts(x, hot))
         if cold:                                          # the only vectors that cross the bus: X out, the sum back
             y = o.add(y, o.put(self.host.experts(L, o.get(x), cold, gate[:, cold].T)))
         return y
 
-    def route(self, L, x):
-        """Router on this device: -> (top [m, k] experts, gate [m, E] weights) on the host."""
-        o, c = self.o, self.c
-        vals, top = o.topk(o.softmax(o.linear(x, self.lin(f"layers.{L}.mlp.gate"))), c.num_experts_per_tok)
-        wts = o.get(vals)
+    def route(self, L, probs):
+        """Router probabilities [m, E] -> (top [m, k] experts, gate [m, E] weights) on the host."""
+        c, P = self.c, self.o.get(probs)               # one read of [m, E]; the choice is made on the host
+        top = np.argsort(-P, axis=1, kind="stable")[:, :c.num_experts_per_tok]    # ties: lowest index, as ttnn.topk
+        wts = np.take_along_axis(P, top, 1)
         wts = wts / wts.sum(1, keepdims=True) if c.norm_topk_prob else wts
-        gate = np.zeros((x.shape[0], c.num_experts))
-        for i in range(x.shape[0]):
+        gate = np.zeros((probs.shape[0], c.num_experts))
+        for i in range(probs.shape[0]):
             gate[i, top[i]] = wts[i]
             self.routes[L, self.t + i] = top[i]
         return top, gate
 
-    def shared(self, L, x):
-        """The gated shared expert (this device's rows of it, when the dense part is split)."""
+    def dense_mlp(self, L, x, router=True):
+        """-> (router probabilities or None, the gated shared expert: this device's rows of it when the dense part
+        is split); the weights that read x in one fused read."""
         o, p = self.o, f"layers.{L}.mlp"
-        return o.mul(o.linear(o.mul(o.silu(o.linear(x, self.lin(p + ".shared_expert.gate_proj"))),
-                                    o.linear(x, self.lin(p + ".shared_expert.up_proj"))), self.lin(p + ".shared_expert.down_proj")),
-                     o.sigmoid(o.linear(x, self.lin(p + ".shared_expert_gate"))))
+        g, u, sg, *r = self.lins(x, [p + ".shared_expert.gate_proj", p + ".shared_expert.up_proj",
+                                     p + ".shared_expert_gate"] + ([p + ".gate"] if router else []))
+        y = o.mul(o.linear(o.mul(o.silu(g), u), self.lin(p + ".shared_expert.down_proj")), o.sigmoid(sg))
+        return (o.softmax(r[0]) if router else None), y
 
-    def expert(self, x, gu, dn, gcol):
-        """A routed expert on every row of x, scaled per row by gcol [m, 1] (0: that token does not use it)."""
-        o, I = self.o, self.c.moe_intermediate_size
-        h = o.linear(x, gu)
-        return o.mul(o.linear(o.mul(o.silu(o.slice(h, 1, 0, I)), o.slice(h, 1, I, 2 * I)), dn), o.put(gcol))
+    def slot_experts(self, x, items):
+        """Routed experts in this device's slots on every row of x: items = [(gate, up, down, g [m] host weights, 0
+        where a token does not use it)] -> their weighted sum [m, d]. 4 ops per expert, 6 per call."""
+        o, ys = self.o, []
+        for wg, wu, dn, _ in items:
+            ys.append(o.linear(o.mul(o.linear(x, wg, act="silu"), o.linear(x, wu)), dn))
+        (m, d), n = ys[0].shape, len(ys)
+        G = o.put(np.stack([g for *_, g in items])[:, :, None])                      # [n, m, 1], one upload
+        return o.reshape(o.sum(o.mul(o.reshape(o.concat(ys, 0), (n, m, d)), G), 0), (m, d))
 
     def promote(self):
         """After a step: the cache's copies into the card's slots."""
@@ -330,16 +372,42 @@ class Card:
 
     def layers(self, h4, tokens=()):
         """h4 [m, hc*d] residual rows of m consecutive positions starting at self.t -> after the last layer."""
-        o, c = self.o, self.c
         self.pending = {}
-        for L in range(c.num_hidden_layers):
+        for L in range(self.c.num_hidden_layers):
             if L in self.ple:
-                h4 = o.add(h4, self.ple_layer(L, h4, list(tokens)))
-            x, inj = self.hc_read(f"layers.{L}.attn_hyper_connection", h4)
-            h4 = self.hc_write(h4, inj, self.deltanet(L, x) if c.layer_types[L] == "linear_attention" else self.attention(L, x))
-            x, inj = self.hc_read(f"layers.{L}.mlp_hyper_connection", h4)
-            h4 = self.hc_write(h4, inj, self.moe(L, x))
+                h4 = self.o.add(h4, self.ple_layer(L, h4, list(tokens)))
+            h4 = (self.deltanet_layer if self.c.layer_types[L] == "linear_attention" else self.attention_layer)(L, h4)
         return h4
+
+    def seg(self, name, fn, *args):
+        """fn(*args) as a traced segment when the pass has m <= self.trace tokens (fn: card ops only, no side
+        effects; its outputs are overwritten by its next replay), else eagerly"""
+        m = args[0].shape[0]
+        return self.o.trace((id(self), name, m), fn, *args) if m <= self.trace else fn(*args)
+
+    def deltanet_layer(self, L, h4):
+        def dense(h4, conv, S):                        # everything up to the routing decision, on the card alone
+            x, inj = self.hc_read(f"layers.{L}.attn_hyper_connection", h4)
+            out, win, states = self.deltanet_core(L, x, conv, S)
+            h4 = self.hc_write(h4, inj, out)
+            x, inj = self.hc_read(f"layers.{L}.mlp_hyper_connection", h4)
+            return (h4, x, inj, win, states) + self.dense_mlp(L, x)
+        h4, x, inj, win, states, probs, y = self.seg(L, dense, h4, self.state[L]["conv"], self.state[L]["S"])
+        self.pending[L] = dict(win=win, states=states)
+        return self.hc_write(h4, inj, self.moe(L, x, (probs, y)))
+
+    def attention_layer(self, L, h4):
+        def pre(h4):
+            x, inj = self.hc_read(f"layers.{L}.attn_hyper_connection", h4)
+            return (x, inj, *self.attn_proj(L, x))
+
+        def post(h4, inj, out):
+            h4 = self.hc_write(h4, inj, out)
+            x, inj = self.hc_read(f"layers.{L}.mlp_hyper_connection", h4)
+            return (h4, x, inj) + self.dense_mlp(L, x)
+        x, inj, *proj = self.seg((L, "pre"), pre, h4)
+        h4, x, inj, probs, y = self.seg((L, "post"), post, h4, inj, self.attention(L, x, proj))
+        return self.hc_write(h4, inj, self.moe(L, x, (probs, y)))
 
     def verify(self, tokens):
         """The next m tokens (the last accepted token and m-1 drafts) in one pass; returns their mixer outputs [m, d].

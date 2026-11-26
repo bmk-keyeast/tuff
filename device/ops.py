@@ -29,10 +29,40 @@ def bf16_round(w):
 class Torch:
     def __init__(self):
         import torch
-        self.t = torch
+        self.t, self.traces, self.tracing = torch, {}, False
+
+    def _host(self):
+        if self.tracing:
+            raise RuntimeError("host transfer inside a traced segment")
+
+    def trace(self, key, fn, *args):
+        """fn(*args) as a captured trace, emulated: the first call warms up (eager) and captures fn on persistent
+        input buffers; every call copies args into them, re-runs fn with host transfers forbidden, and writes the
+        results into the same output tensors -- the card's trace semantics, so a host transfer or a stale alias in a
+        traced segment fails here first."""
+        if key not in self.traces:
+            fn(*args)
+            buf = [a.clone() for a in args]
+            self.tracing = True
+            try:
+                self.traces[key] = (buf, fn(*buf))
+            finally:
+                self.tracing = False
+        buf, outs = self.traces[key]
+        for b, a in zip(buf, args):
+            b.copy_(a)
+        self.tracing = True
+        try:
+            new = fn(*buf)
+        finally:
+            self.tracing = False
+        for o, n in zip(outs, new):
+            o.copy_(n)
+        return outs
 
     # host <-> card
     def put(self, a, fmt="f32"):
+        self._host()
         a = np.asarray(a, np.float32)
         a = bf16_round(a) if fmt == "bf16" else a
         return self.t.from_numpy(np.ascontiguousarray(a))
@@ -47,13 +77,19 @@ class Torch:
         return self.t.from_numpy(np.ascontiguousarray(w.T))
 
     def get(self, x):
+        self._host()
         return x.numpy().astype(np.float64)
 
     def zeros(self, shape):
+        self._host()
         return self.t.zeros(shape)
 
     # arithmetic (broadcasting like numpy)
-    def linear(self, x, w): return x @ w
+    def linear(self, x, w, act=None):
+        """x @ w, then act (None, "silu", "sigmoid") fused in"""
+        y = x @ w
+        return y if act is None else getattr(self, act)(y)
+
     def matmul(self, a, b): return a @ b
     def add(self, a, b): return a + b
     def sub(self, a, b): return a - b
@@ -73,6 +109,10 @@ class Torch:
     def mean(self, a, dim): return a.mean(dim, keepdim=True)
     def softmax(self, a): return self.t.softmax(a, -1)
 
+    def rms_norm(self, x, w, eps):
+        """RMSNorm over the last dim, times w (broadcast)"""
+        return x * self.t.rsqrt((x * x).mean(-1, keepdim=True) + eps) * w
+
     # shape
     def reshape(self, a, shape): return a.reshape(shape)
     def slice(self, a, dim, start, end): return a.narrow(dim, start, end - start)
@@ -82,13 +122,16 @@ class Torch:
     def topk(self, a, k):
         """k largest of each row of a [m, n], ties to the lowest index (as ttnn.topk(stable=True)); returns (values
         [m, k] on the card, indices [m, k] on the host)."""
+        self._host()
         idx = np.argsort(-a.numpy(), axis=1, kind="stable")[:, :k]
         return self.t.gather(a, 1, self.t.from_numpy(idx)), idx
 
     def gather_rows(self, table, idx):
+        self._host()
         return table[self.t.as_tensor(np.asarray(idx, np.int64))]
 
     def write_rows(self, table, i, rows):
+        self._host()
         table[i:i + rows.shape[0]] = rows
         return table
 
@@ -117,7 +160,7 @@ class TTNN:
     def __init__(self, device):
         import torch
         import ttnn
-        self.ttnn, self.t, self.dev = ttnn, torch, device
+        self.ttnn, self.t, self.dev, self.traces = ttnn, torch, device, {}
         self.dt = {"f32": ttnn.float32, "bf16": ttnn.bfloat16, "bfp8": ttnn.bfloat8_b, "bfp4": ttnn.bfloat4_b}
 
     def _to(self, a, dtype):
@@ -139,7 +182,7 @@ class TTNN:
     def zeros(self, shape):
         return self._to(np.zeros(shape, np.float32), self.ttnn.float32)
 
-    def linear(self, x, w): return self.ttnn.linear(x, w)
+    def linear(self, x, w, act=None): return self.ttnn.linear(x, w, activation=act)
     def matmul(self, a, b): return self.ttnn.matmul(a, b)
     def add(self, a, b): return self.ttnn.add(a, b)
     def sub(self, a, b): return self.ttnn.subtract(a, b)
@@ -158,6 +201,11 @@ class TTNN:
     def sum(self, a, dim): return self.ttnn.sum(a, dim=dim, keepdim=True)
     def mean(self, a, dim): return self.ttnn.mean(a, dim=dim, keepdim=True)
     def softmax(self, a): return self.ttnn.softmax(a, dim=-1)
+
+    def rms_norm(self, x, w, eps):
+        # ponytail: weight= (a [d] TILE tensor) would fold the multiply in; per-stream [hc, d] weights cannot
+        return self.ttnn.multiply(self.ttnn.rms_norm(x, epsilon=eps), w)
+
     def reshape(self, a, shape): return self.ttnn.reshape(a, shape)
 
     def slice(self, a, dim, start, end):
@@ -182,6 +230,25 @@ class TTNN:
         r = self.get(rows)
         t[i:i + r.shape[0]] = r
         return self.put(t)
+
+    def trace(self, key, fn, *args):
+        """Metal trace: the first call runs fn eagerly (compiles its programs, uploads lazy constants), then captures
+        it on persistent clones of args; every call copies args into those (device to device) and replays. The
+        outputs are the same tensors every replay: the caller must be done with them before the next replay of
+        `key`. Open the device with a trace_region_size that holds every key's commands."""
+        tt = self.ttnn
+        if key not in self.traces:
+            fn(*args)
+            buf = [tt.clone(a) for a in args]
+            tid = tt.begin_trace_capture(self.dev, cq_id=0)
+            outs = fn(*buf)
+            tt.end_trace_capture(self.dev, tid, cq_id=0)
+            self.traces[key] = (tid, buf, outs)
+        tid, buf, outs = self.traces[key]
+        for b, a in zip(buf, args):
+            tt.copy(a, b)                              # input_a into input_b
+        tt.execute_trace(self.dev, tid, cq_id=0, blocking=False)
+        return outs
 
     def gdr(self, q, k, v, g, beta, state, scale):
         tt = self.ttnn

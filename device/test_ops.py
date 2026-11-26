@@ -18,7 +18,7 @@ from ops import Torch, TTNN  # noqa: E402
 
 def main():
     import ttnn
-    dev = ttnn.open_device(device_id=0)
+    dev = ttnn.open_device(device_id=0, trace_region_size=1 << 20)   # ponytail: qfn's 60 segments need more; size from the error
     a, b = Torch(), TTNN(dev)
     rng = np.random.default_rng(0)
     x, y = rng.standard_normal((4, 96)), rng.standard_normal((4, 96))
@@ -32,7 +32,11 @@ def main():
         "linear (weight bf16)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bf16")),
         "linear (weight bfp8)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bfp8")),
         "linear (weight bfp4)": lambda o: o.linear(o.put(x), o.put_weight(wt, "bfp4")),
+        "linear + fused silu": lambda o: o.linear(o.put(x), o.put_weight(wt, "bf16"), act="silu"),
         "matmul": lambda o: o.matmul(o.put(x), o.put(m)),
+        "rms_norm (3-D, per-row weight)": lambda o: o.rms_norm(o.reshape(o.put(x), (4, 4, 24)), o.put(y[:4, :24]), 1e-6),
+        "trace: captured, replayed on new input": lambda o: [o.trace("t", lambda a: (o.silu(o.mul(a, a)),), o.put(z))
+                                                             for z in (y, x)][-1][0],
         "add / mul / scale": lambda o: o.scale(o.add(o.mul(o.put(x), o.put(y)), o.put(y)), 0.5),
         "broadcast [4,1] * [1,96]": lambda o: o.mul(o.put(x[:, :1]), o.put(y[:1])),
         "silu / sigmoid / exp": lambda o: o.add(o.silu(o.put(x)), o.mul(o.sigmoid(o.put(y)), o.exp(o.scale(o.put(x), 0.1)))),

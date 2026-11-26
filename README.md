@@ -259,7 +259,25 @@ vector; the two partial sums meet in host memory once per block. One expert cach
 an uneven split (3:1 DeltaNet key heads) give the same outputs as one device (1.6e-6), the same routing and the same
 slot decisions, and that speculative greedy decoding on the two devices equals plain greedy decoding on one.
 
-Not there yet: fused ops and traces for speed on the card, and a CUDA backend for ops.py (the GPU side runs on the
+**Fewer dispatches.** Every ttnn call costs host time to dispatch whatever its size, and a QFN pass is thousands of
+small ops, so [`device/opcount.py`](device/opcount.py) counts them ([`results/opcount.md`](results/opcount.md), every
+routed expert in a slot, scaled to QFN's 48 layers and top-10):
+
+| one pass, m = 1 token | card ops dispatched | host transfers |
+|---|---:|---:|
+| before | 10,297 | 602 |
+| weights that read the same input stacked into one linear per format, one-op RMSNorm, RoPE as one matmul | 5,698 | 242 |
+| + experts as gate (SiLU fused) / up / down, gate weights applied once per layer, routing read once as [m, E] | 4,690 | 194 |
+| + traced segments: each DeltaNet layer's dense part, both dense ends of each attention layer (60 replays) | **4,054** | **194** |
+
+(m = 3, an MTP verify pass: 17,952 → 7,992.) A traced segment ([`ops.trace`](device/ops.py)) is captured once and
+replayed from the card's trace buffer; on the CPU backend the emulation forbids host transfers inside it and writes
+every replay into the same output tensors, so `test_qfn.py` / `test_tp.py` also check that nothing traced reads the
+host or keeps a stale alias. The stacked weights round exactly as before (same BFP blocks: the tuff-format check gives
+the same 7.2e-2 / 96.3%). What is left is mostly the routed experts (4 ops each) and the per-token attention core.
+
+Not there yet: the per-token attention core on the card (ttnn's SDPA decode with the indexer's block choice),
+experts as one sparse matmul per layer, and a CUDA backend for ops.py (the GPU side runs on the
 Torch backend; with torch on CUDA it is the same code).
 
 ## What exists
@@ -339,6 +357,7 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [ ] On the card: `device/test_ops.py`, then the card code; measure the real round trip and the card's bandwidth
 - [x] QFN's MTP drafter in the reference, on the real weights: chained drafts accepted 71% / 52% / 36%, 2.08 tokens per step
 - [x] MTP speculative decoding in the card code: verify + rollback, QFN's drafter, == plain greedy (CPU backend)
+- [x] Card dispatches per pass: 10,297 → 4,054 ops (fused linears, traced segments), counted by `device/opcount.py`
 - [ ] Prefill: stream experts to the card in layer order instead of computing them on the CPU
 - [ ] N-gram table on NVMe with prefetch
 - [ ] AVX-512 kernels for the 8259CL, only if `bench/host.sh` shows cold experts compute-bound (on paper AVX2 already
@@ -390,6 +409,9 @@ reporting set to "OS First" in the BIOS.
   카드 슬롯은 C 캐시(`tcache`)가 관리. numpy 호스트와 결과·슬롯 판단이 같음을 CI에서 확인
 - **카드 + 4060 Ti 분할 실행**(`device/tp.py`): dense 연산을 헤드·행 단위로 두 장치에 나누고 부분합은 호스트에서 합침.
   전문가 슬롯은 두 장치를 하나의 캐시로 관리. 한 장치로 돌린 결과와 같고(1.6e-6), 추측 디코딩도 일반 greedy와 같음을 확인
+- **카드 연산 수 줄이기**(`device/opcount.py`): 같은 입력을 읽는 가중치를 하나의 linear로 합치고, RMSNorm·RoPE를 한 연산으로,
+  전문가는 SiLU를 matmul에 붙이고, dense 구간은 trace로 묶음. 토큰 1개 패스의 카드 연산이 10,297 → 4,054개, 호스트 왕복
+  602 → 194번. 결과·양자화 오차는 그대로
 
 **다음 할 일:** 카드가 오면 `device/test_ops.py`부터 실행해 ttnn 연산을 맞추고 실측, 4060 Ti에서 `test_cuda` 실행, 전문가 복사 엔진.
 
