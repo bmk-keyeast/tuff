@@ -47,25 +47,60 @@ class Host:
         self.r.tokens = list(tokens)
         return np.asarray(self.w[f"layers.{L}.ple.ple_embedding.ngram_embedding.weight"][self.r.ngram_ids(L)]).ravel()
 
-    def experts(self, L, x, es, wts):
-        p, y = f"layers.{L}.mlp.experts.", 0
-        for e, we in zip(es, wts):
-            g, u = np.split(np.asarray(self.w[p + "gate_up_proj"][e], np.float64) @ x, 2)
-            y = y + we * (np.asarray(self.w[p + "down_proj"][e], np.float64) @ (g / (1 + np.exp(-g)) * u))
-        return y
+    def experts(self, L, X, es, G):
+        """A layer's cold experts for m tokens at once: X [m, d], es: k experts, G [k, m] gate weights (0: the token
+        does not use that expert). Returns [m, d]."""
+        p, Y = f"layers.{L}.mlp.experts.", np.zeros_like(X)
+        for e, gw in zip(es, G):
+            gu, dn = np.asarray(self.w[p + "gate_up_proj"][e], np.float64), np.asarray(self.w[p + "down_proj"][e], np.float64)
+            for i in np.flatnonzero(gw):
+                g, u = np.split(gu @ X[i], 2)
+                Y[i] += gw[i] * (dn @ (g / (1 + np.exp(-g)) * u))
+        return Y
+
+
+class PyCache:
+    """The adaptive cache's policy in Python (the engine's is C: tcache, same policy): which experts sit in the card's
+    slots; after each step up to `budget` of the step's misses (lowest (layer, expert) first) are copied in, evicting
+    the least recently used."""
+
+    def __init__(self, n_slots, budget):
+        self.n, self.budget, self.lru, self.missed = n_slots, budget, OrderedDict(), []
+
+    def lookup(self, keys):
+        hit = []
+        for k in keys:
+            hit.append(k in self.lru)
+            if hit[-1]:
+                self.lru.move_to_end(k)
+            else:
+                self.missed.append(k)
+        return hit
+
+    def end_step(self):
+        """-> [(expert to copy in, expert evicted or None)]"""
+        out = []
+        for key in sorted(set(self.missed))[:self.budget]:
+            ev = self.lru.popitem(last=False)[0] if len(self.lru) >= self.n else None
+            self.lru[key] = True
+            out.append((key, ev))
+        self.missed = []
+        return out
 
 
 class Card:
-    def __init__(self, ops, w, cfg, host, dense_fmt="bfp8", expert_fmt="bfp4", slots=10_000, budget=25, max_t=4096):
+    def __init__(self, ops, w, cfg, host, dense_fmt="bfp8", expert_fmt="bfp4", slots=10_000, budget=25, max_t=4096,
+                 cache=None):
         self.o, self.w, self.c, self.host = ops, w, cfg, host
-        self.dense_fmt, self.expert_fmt, self.n_slots, self.budget, self.max_t = dense_fmt, expert_fmt, slots, budget, max_t
+        self.cache = cache or PyCache(slots, budget)
+        self.dense_fmt, self.expert_fmt, self.max_t = dense_fmt, expert_fmt, max_t
         c = cfg
         self.d, self.hc, self.eps = c.hidden_size, c.hc_count, c.rms_norm_eps
         rp = c.rope_parameters
         self.rd = int(c.head_dim * rp.get("partial_rotary_factor", 1.0))
         self.inv_freq = 1.0 / (rp["rope_theta"] ** (np.arange(0, self.rd, 2) / self.rd))
         self.gated_act = (c.output_gate_type or c.hidden_act) == "sigmoid"
-        self.dev, self.slots, self.missed, self.routes = {}, OrderedDict(), [], {}
+        self.dev, self.slots, self.routes = {}, {}, {}      # slots: (layer, expert) -> its weights on the card
         self.t, self.tokens = 0, []                    # committed tokens; the next one sits at position t
         self.hits = self.lookups = 0
         self.ple = {L - 1 for L in c.ple_layer_ids}
@@ -210,13 +245,11 @@ class Card:
         return o.linear(o.concat(outs, 0), self.lin(p + ".o_proj"))
 
     # ---- MoE: router on the card; slot experts on the card (each read once for all m rows), the rest on the host
-    def slot(self, L, e):
-        key = (L, e)
-        if key not in self.slots:
-            p = f"layers.{L}.mlp.experts."
-            gu, dn = np.asarray(self.w[p + "gate_up_proj"][e]), np.asarray(self.w[p + "down_proj"][e])
-            self.slots[key] = (self.o.put_weight(gu, self.expert_fmt), self.o.put_weight(dn, self.expert_fmt))
-        return self.slots[key]
+    def upload(self, L, e):
+        # ponytail: from the float weights; on the card this is tstore_expert_tt's tiles, copied as they are
+        p = f"layers.{L}.mlp.experts."
+        gu, dn = np.asarray(self.w[p + "gate_up_proj"][e]), np.asarray(self.w[p + "down_proj"][e])
+        return self.o.put_weight(gu, self.expert_fmt), self.o.put_weight(dn, self.expert_fmt)
 
     def moe(self, L, x):
         o, c, p = self.o, self.c, f"layers.{L}.mlp"
@@ -231,32 +264,28 @@ class Card:
         y = o.mul(o.linear(o.mul(o.silu(o.linear(x, self.lin(p + ".shared_expert.gate_proj"))),
                                  o.linear(x, self.lin(p + ".shared_expert.up_proj"))), self.lin(p + ".shared_expert.down_proj")),
                   o.sigmoid(o.linear(x, self.lin(p + ".shared_expert_gate"))))
-        cold = np.zeros((m, self.d))
-        xh = None
-        for e in sorted(set(top.ravel().tolist())):
+        es = sorted(set(top.ravel().tolist()))
+        cold = []
+        for e, hit in zip(es, self.cache.lookup([(L, e) for e in es])):
             n = int((gate[:, e] > 0).sum())
             self.lookups += n
-            if (L, e) in self.slots:
+            if hit:
                 self.hits += n
-                self.slots.move_to_end((L, e))
                 gu, dn = self.slots[L, e]
                 h = o.linear(x, gu)
                 ye = o.linear(o.mul(o.silu(o.slice(h, 1, 0, I)), o.slice(h, 1, I, 2 * I)), dn)
                 y = o.add(y, o.mul(ye, o.put(gate[:, e:e + 1])))
-            else:                                         # the only vectors that cross the bus
-                xh = o.get(x) if xh is None else xh
-                for i in np.flatnonzero(gate[:, e]):
-                    cold[i] += self.host.experts(L, xh[i], [e], [gate[i, e]])
-                self.missed.append((L, e))
-        return o.add(y, o.put(cold)) if xh is not None else y
+            else:
+                cold.append(e)
+        if cold:                                          # the only vectors that cross the bus: X out, the sum back
+            y = o.add(y, o.put(self.host.experts(L, o.get(x), cold, gate[:, cold].T)))
+        return y
 
     def promote(self):
-        """After a step: copy up to `budget` missed experts into slots, evicting the least recently used."""
-        for key in sorted(set(self.missed))[:self.budget]:
-            while len(self.slots) >= self.n_slots:
-                self.slots.popitem(last=False)
-            self.slot(*key)
-        self.missed = []
+        """After a step: the cache's copies into the card's slots."""
+        for (L, e), ev in self.cache.end_step():
+            self.slots.pop(ev, None)
+            self.slots[L, e] = self.upload(L, e)
 
     # ---- PLE: the host hashes the N-gram ids and sends the rows; the card gates and convolves
     def ple_layer(self, L, h4, tokens):

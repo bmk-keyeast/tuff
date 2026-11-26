@@ -17,6 +17,7 @@ enum { TSTORE_MAX_LAYERS = 64, TSTORE_D = 2560, TSTORE_I = 640 };
 
 typedef struct {
     enum bfp_fmt fmt;
+    int D, I;                                 /* hidden and expert widths: 2560 and 640 for QFN */
     int layers, experts;                      /* experts per layer (512 for QFN; fewer in tests) */
     int mtp;                                  /* layer index of the MTP drafter's experts (= layers), or -1 */
     size_t piece[4], expert_bytes;            /* gate_up exp, gate_up mant, down exp, down mant */
@@ -27,8 +28,10 @@ typedef struct {
 /* opens DIR/experts.00.FMT .. experts.(layers-1).FMT, and experts.mtp.FMT if present (as layer s->mtp);
  * 0 on success, -1 (and a message on stderr) otherwise */
 int tstore_open(tstore *s, const char *dir, enum bfp_fmt fmt, int layers, int lock);
+/* the same for other widths (tests use a tiny model): D, I multiples of 16 */
+int tstore_open_dims(tstore *s, const char *dir, enum bfp_fmt fmt, int layers, int lock, int D, int I);
 void tstore_close(tstore *s);
-/* views of expert e of layer L: gate [640][2560], up [640][2560], down [2560][640] */
+/* views of expert e of layer L: gate [I][D], up [I][D], down [D][I] (QFN: [640][2560], [640][2560], [2560][640]) */
 void tstore_expert(const tstore *s, int L, int e, bfp_mat *gate, bfp_mat *up, bfp_mat *down);
 /* expert e of layer L as the p150a stores it: TT tiles of gate_up^T [2560][1280] (gate columns 0..639, up 640..1279),
  * then of down^T [640][2560]; expert_bytes in all, like the host copy. dst: expert_bytes. */

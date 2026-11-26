@@ -17,6 +17,10 @@ test_cache: test_cache.c cache.c cache.h
 test_store: test_store.c store.c store.h bfp.c tt_tile.c bfp.h
 	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined test_store.c store.c bfp.c tt_tile.c -o $@ $(LDLIBS)
 
+# the host side for the Python card code (device/host_c.py)
+libtuff.so: capi.c bfp.c cache.c store.c tt_tile.c bfp.h cache.h store.h
+	$(CC) $(CFLAGS) -shared -fPIC capi.c bfp.c cache.c store.c tt_tile.c -o $@ $(LDLIBS)
+
 # NVIDIA GPU (RTX 4060 Ti = sm_89). Not part of `make all`: CI only compiles it; run ./test_cuda on the real box.
 NVCC ?= nvcc
 CUDA_ARCH ?= sm_89
@@ -31,6 +35,6 @@ test: test_bfp test_cache test_store
 	./test_cache
 
 clean:
-	rm -f test_bfp test_cache test_store bench_bfp test_cuda bfp_host.o
+	rm -f test_bfp test_cache test_store bench_bfp test_cuda bfp_host.o libtuff.so
 
 .PHONY: all test clean

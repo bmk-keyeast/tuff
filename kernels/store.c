@@ -10,10 +10,13 @@
 static const char *fmt_name(enum bfp_fmt f) { return f == BFP8 ? "bfp8" : "bfp4"; }
 
 int tstore_open(tstore *s, const char *dir, enum bfp_fmt fmt, int layers, int lock) {
-    const int D = TSTORE_D, I = TSTORE_I;
+    return tstore_open_dims(s, dir, fmt, layers, lock, TSTORE_D, TSTORE_I);
+}
+
+int tstore_open_dims(tstore *s, const char *dir, enum bfp_fmt fmt, int layers, int lock, int D, int I) {
     memset(s, 0, sizeof *s);
-    if (layers < 1 || layers >= TSTORE_MAX_LAYERS) return -1;
-    s->fmt = fmt;
+    if (layers < 1 || layers >= TSTORE_MAX_LAYERS || D % 16 || I % 16) return -1;
+    s->fmt = fmt; s->D = D; s->I = I;
     s->piece[0] = (size_t)(2 * I / 16) * D;
     s->piece[1] = bfp_mant_bytes(fmt, 2 * I, D);
     s->piece[2] = (size_t)(D / 16) * I;
@@ -52,17 +55,17 @@ void tstore_close(tstore *s) {
 }
 
 void tstore_expert(const tstore *s, int L, int e, bfp_mat *gate, bfp_mat *up, bfp_mat *down) {
-    const int D = TSTORE_D, I = TSTORE_I;
+    const int D = s->D, I = s->I;
     uint8_t *x = s->base[L] + (size_t)e * s->expert_bytes, *gu_exp = x, *gu_mant = x + s->piece[0];
     uint8_t *dn = gu_mant + s->piece[1];
-    size_t panels = I / 16;                                  /* gate = panels 0..39, up = 40..79 */
+    size_t panels = I / 16;                                  /* gate = panels 0..I/16-1, up = the rest */
     *gate = (bfp_mat){s->fmt, I, D, gu_exp, gu_mant};
     *up = (bfp_mat){s->fmt, I, D, gu_exp + panels * D, gu_mant + bfp_mant_bytes(s->fmt, I, D)};
     *down = (bfp_mat){s->fmt, D, I, dn, dn + s->piece[2]};
 }
 
 void tstore_expert_tt(const tstore *s, int L, int e, uint8_t *dst) {
-    const int D = TSTORE_D, I = TSTORE_I;
+    const int D = s->D, I = s->I;
     uint8_t *x = s->base[L] + (size_t)e * s->expert_bytes;
     bfp_mat gu = {s->fmt, 2 * I, D, x, x + s->piece[0]};
     bfp_mat dn = {s->fmt, D, I, x + s->piece[0] + s->piece[1], x + s->piece[0] + s->piece[1] + s->piece[2]};
