@@ -64,3 +64,4 @@ jobs:
       - run: python device/test_tp.py    # card + GPU split == one device; speculative == greedy on it
       - run: python device/opcount.py    # card ops and host transfers per pass
       - run: make -C kernels libtuff.so && python device/test_host_c.py && python device/test_run.py   # ... over the C host side == over numpy
+      - run: make -C engine && python engine/test_engine.py && python engine/test_engine.py --store   # C++ engine == Python card code

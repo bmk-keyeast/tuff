@@ -10,3 +10,5 @@ kernels/test_cuda
 kernels/bfp_host.o
 kernels/bench_mem
 kernels/libtuff.so
+engine/tuff_engine
+engine/*.o
