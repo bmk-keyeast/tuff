@@ -209,8 +209,11 @@ def decode_multi(host, gpu, u_card, u_gpu, u_cold, m=1, accepted=1, dense_fmt="b
                  + p["hc"] / q["L"] * b["hc"] + (2 * q["d"] ** 2 + DRAFT_VOCAB * q["d"]) * b["lm_head"])
     # its control: 3 reads (routing, block choice, draft head) and one layer's calls (opcount: ~45)
     t_draft = mtp_dense / a + q["k"] * mm["eb"] / cpu_bw + 3 * (PCIE_RT_US + AFTER_READ * DISPATCH_US) * 1e-6
-    t = t_dense + t_sync + t_ctl + max(t_hot, t_gpu, t_cold + t_pcie) + (m - 1) * t_draft
-    links = [t_ctl + t_pcie + promote_card * mm["eb"] / (PCIE * PCIE_EFF), host_busy(m) + (m - 1) * t_draft]
+    # after each verify, one MTP pass over the accepted rows fills its cache (no draft head; experts ~ one row's)
+    t_catch = ((mtp_dense - DRAFT_VOCAB * q["d"] * b["lm_head"]) / a + q["k"] * mm["eb"] / cpu_bw
+               + 2 * (PCIE_RT_US + AFTER_READ * DISPATCH_US) * 1e-6) if m > 1 else 0.0
+    t = t_dense + t_sync + t_ctl + max(t_hot, t_gpu, t_cold + t_pcie) + (m - 1) * t_draft + t_catch
+    links = [t_ctl + t_pcie + promote_card * mm["eb"] / (PCIE * PCIE_EFF), host_busy(m) + (m - 1) * t_draft + t_catch]
     if gpu:
         links.append(promote_gpu * mm["eb"] / (gpu["link"] * PCIE_EFF))
     return accepted / max([t] + links)

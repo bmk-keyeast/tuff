@@ -209,6 +209,13 @@ def main(T=40):
                                                   expert_fmt="f32"), 2)
     print(f"speculative greedy (MTP drafter, prompt in passes of 5) == plain greedy: {out == truth}")
     assert out == truth
+    vocab = np.unique(np.concatenate([np.random.default_rng(2).choice(c.vocab_size, 300, replace=False), truth[:8]]))
+    card = mk()
+    out = card.generate(prompt, n, qfn.MTPDrafter(Torch(), mtp_weights(c), c, qfn.Host(w, c), vocab=vocab,
+                                                  dense_fmt="f32", expert_fmt="f32"), 2)
+    print(f"speculative greedy (MTP drafter over a {len(vocab)}-token draft vocabulary) == plain greedy: {out == truth}, "
+          f"{card.steps} steps")
+    assert out == truth
 
     tuff = qfn.Card(Torch(), w, c, qfn.Host(w, c), dense_fmt={"lm_head": "bfp4", "lin_z": "bfp4"}, expert_fmt="bfp4",
                     slots=n_slots, budget=4)

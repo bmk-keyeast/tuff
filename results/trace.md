@@ -65,12 +65,12 @@ Adaptive cache with up to 25 copies per token, hit rate measured on 'wikitext th
 
 | Host | Dense on card | Hit rate | no MTP | prose | chat | structured | QFN MTP (measured) |
 |---|---|---:|---:|---:|---:|---:|---:|
-| E5-2690v4, 4x16GB | bfp8 | 89.7% | 33.1 | 52.7 | 60.1 | 110.3 | 48.4 |
-| E5-2690v4, 4x16GB | tuff-mix | 90.1% | 36.4 | 58.0 | 66.3 | 122.7 | 53.3 |
-| E5-2690v4, 4x16GB | tuff-mix2 | 90.4% | 39.4 | 61.4 | 69.8 | 126.8 | 56.3 |
-| 8259CL, 6x32GB | bfp8 | 89.7% | 33.1 | 53.3 | 61.1 | 113.7 | 49.1 |
-| 8259CL, 6x32GB | tuff-mix | 90.1% | 36.4 | 58.8 | 67.4 | 126.8 | 54.1 |
-| 8259CL, 6x32GB | tuff-mix2 | 90.4% | 39.4 | 62.3 | 71.1 | 131.2 | 57.3 |
+| E5-2690v4, 4x16GB | bfp8 | 89.7% | 33.1 | 51.3 | 58.7 | 108.7 | 47.2 |
+| E5-2690v4, 4x16GB | tuff-mix | 90.1% | 36.4 | 56.4 | 64.6 | 120.7 | 51.9 |
+| E5-2690v4, 4x16GB | tuff-mix2 | 90.4% | 39.4 | 59.6 | 68.0 | 124.6 | 54.8 |
+| 8259CL, 6x32GB | bfp8 | 89.7% | 33.1 | 52.3 | 60.0 | 112.4 | 48.2 |
+| 8259CL, 6x32GB | tuff-mix | 90.1% | 36.4 | 57.6 | 66.2 | 125.2 | 53.1 |
+| 8259CL, 6x32GB | tuff-mix2 | 90.4% | 39.4 | 61.0 | 69.7 | 129.5 | 56.1 |
 
 ### With an RTX 4060 Ti 16 GB next to the p150a
 
@@ -78,9 +78,9 @@ Dense on the card as tuff's default (LM head and DeltaNet z in BFP4, the rest BF
 
 | Setup | GPU share of dense | Experts on card + GPU | Hit rate | no MTP | prose | chat | structured | QFN MTP (measured) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| p150a only | 0% | 10,019 + 0 | 90.1% | 36.4 | 58.0 | 66.3 | 122.7 | 53.3 |
-| + 4060 Ti, expert cache | 0% | 10,019 + 5,631 | 97.1% | 38.5 | 63.7 | 73.2 | 138.0 | 58.7 |
-| + 4060 Ti, expert cache + split dense | 41% | 10,581 + 4,791 | 97.0% | 47.1 | 73.2 | 83.2 | 149.7 | 67.2 |
+| p150a only | 0% | 10,019 + 0 | 90.1% | 36.4 | 56.4 | 64.6 | 120.7 | 51.9 |
+| + 4060 Ti, expert cache | 0% | 10,019 + 5,631 | 97.1% | 38.5 | 61.8 | 71.2 | 135.4 | 57.0 |
+| + 4060 Ti, expert cache + split dense | 41% | 10,581 + 4,791 | 97.0% | 47.1 | 70.7 | 80.6 | 146.7 | 64.9 |
 
 ### Predicted decode with the measured hit rate
 

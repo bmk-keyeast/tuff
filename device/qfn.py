@@ -575,45 +575,59 @@ class Card:
 class MTPDrafter:
     """QFN's MTP layer on the card (layout as in Basalt, see ref_real.py): input = per-stream fc_hidden of the main
     model's final residual (pre_fc_norm_hidden per stream) + fc_embedding of the next token's embedding, then one
-    full-attention MoE layer with its own mixer, then the main model's LM head. Its KV cache holds one entry per
-    position, built from the main model's residuals as tokens are accepted (catch_up); chained drafts feed its own
-    residual and guess back in, on cache rows that the next catch_up overwrites."""
+    full-attention MoE layer with its own mixer, then the main model's LM head -- or only its rows for a draft
+    vocabulary (`vocab`: token ids; Basalt ships one, ~106k ids), which cuts the head's read per draft. Its KV cache
+    holds one entry per position, built from the main model's residuals as tokens are accepted (catch_up: one pass
+    for all of them, no head); chained drafts feed its own residual and guess back in, on cache rows that the next
+    catch_up overwrites."""
 
-    def __init__(self, ops, w_mtp, cfg, host, **card_kw):
+    def __init__(self, ops, w_mtp, cfg, host, vocab=None, **card_kw):
         import copy
         mc = copy.deepcopy(cfg)
         mc.num_hidden_layers, mc.layer_types, mc.ple_layer_ids = 1, ["full_attention"], []
         self.m = Card(ops, w_mtp, mc, host, **card_kw)
         self.m.pos0 = 1                                 # cache row r holds position r + 1
-        self.w, self.R = w_mtp, None
+        self.w, self.R, self.vocab, self.head = w_mtp, None, vocab, None
 
-    def run(self, R, tok, row):
-        """One MTP step at cache row `row` from residual R [1, hc*d] and token tok; returns (its residual, its guess)."""
+    def run(self, R, toks, row, guess=True):
+        """The MTP layer on n consecutive cache rows from `row`: R [n, hc*d] main (or its own) residuals, toks the n
+        tokens one position later. Returns (its residuals, its guess after the last row, or None)."""
         m, o = self.m, self.m.o
-        hc, d = m.hc, m.d
-        hn = m.rms(o.reshape(R, (hc, d)), m.norm("pre_fc_norm_hidden.weight", rows=hc))
-        h2 = o.linear(hn, m.lin("fc_hidden"))                                          # [hc, d], per stream
-        e = o.put(m.host.embed(tok)[None])
+        hc, d, n = m.hc, m.d, len(toks)
+        hn = m.rms(o.reshape(R, (n, hc, d)), m.norm("pre_fc_norm_hidden.weight", rows=hc))
+        h2 = o.linear(hn, m.lin("fc_hidden"))                                          # [n, hc, d], per stream
+        e = o.put(np.stack([m.host.embed(t) for t in toks]))
         e2 = o.linear(m.rms(e, m.norm("pre_fc_norm_embedding.weight")), m.lin("fc_embedding"))
         m.t = row
-        x = m.layers(o.reshape(o.add(h2, e2), (1, hc * d)))
+        x = m.layers(o.reshape(o.add(h2, o.reshape(e2, (n, 1, d))), (n, hc * d)))
         m.pending = {}
         m.promote()
-        return x, int(self.lm.lm_argmax(m.hc_read("hyper_connection_mixer", x, combine=False))[0])
+        if not guess:
+            return x, None
+        mixed = m.hc_read("hyper_connection_mixer", o.slice(x, 0, n - 1, n), combine=False)
+        if self.vocab is None:
+            return x, int(self.lm.lm_argmax(mixed)[0])
+        if self.head is None:
+            self.head = o.put_weight(np.asarray(self.lm.w["lm_head.weight"])[self.vocab], m.fmt("lm_head"))
+        return x, int(self.vocab[o.topk(o.linear(mixed, self.head), 1)[1][0, 0]])
 
     def catch_up(self, card, start, j):
         """After card.commit(j) of a verify that started at position `start`: final cache entries for the accepted
-        positions. Row p (position p + 1) comes from the main residual at p and the token at p + 1."""
-        self.lm = card
-        res = lambda p: self.R if p == start - 1 else card.o.slice(card.h4, 0, p - start, p - start + 1)
-        for p in range(max(start - 1, 0), start + j - 1):
-            self.run(res(p), card.tokens[p + 1], p)
-        self.R = res(start + j - 1)                                                    # residual of the last accepted
+        positions, in one pass. Row p (position p + 1) comes from the main residual at p and the token at p + 1."""
+        self.lm, o = card, card.o
+        p0, p1 = max(start - 1, 0), start + j - 1                # rows p0 .. p1-1
+        if p1 > p0:
+            rows = [] if p0 > start - 1 else [self.R]
+            rows.append(o.slice(card.h4, 0, max(p0 - start, 0), p1 - start))
+            R = rows[0] if len(rows) == 1 else o.concat(rows, 0)
+            if R.shape[0]:
+                self.run(R, card.tokens[p0 + 1:p1 + 1], p0, guess=False)
+        self.R = o.slice(card.h4, 0, j - 1, j)                                         # residual of the last accepted
 
     def propose(self, card, nxt, k):
         drafts, R, tok = [], self.R, nxt
         for i in range(k):
-            R, g = self.run(R, tok, card.t - 1 + i)
+            R, g = self.run(R, [tok], card.t - 1 + i)
             drafts.append(g)
             tok = g
         return drafts
