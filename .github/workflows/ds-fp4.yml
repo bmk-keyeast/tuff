@@ -1,0 +1,28 @@
+# DeepSeek-V4.1-Flash-1017's FP4 experts converted to K200 INT4/INT8 and TT BFP4/BFP8 (ds_fp4.py). Reads only the
+# sampled experts (~19 MB each) with HTTP range requests, then commits results/ds_fp4.md.
+name: ds-fp4
+on:
+  workflow_dispatch:
+    inputs:
+      layers: { description: "layers, e.g. 0,10,20,30,39", default: "0,10,20,30,39" }
+      experts: { description: "random experts per layer", default: "8" }
+
+permissions:
+  contents: write
+
+jobs:
+  experts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -q numpy
+      - run: python -u ds_fp4.py --layers "${{ inputs.layers }}" --experts "${{ inputs.experts }}" && cat results/ds_fp4.md >> "$GITHUB_STEP_SUMMARY"
+      - name: commit results
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add results/ds_fp4.md
+          git diff --cached --quiet && exit 0
+          git commit -m "ds-fp4: DeepSeek FP4 experts in K200/TT formats (layers ${{ inputs.layers }}, ${{ inputs.experts }} experts each)"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done; exit 1
