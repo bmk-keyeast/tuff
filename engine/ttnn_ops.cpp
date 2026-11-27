@@ -195,6 +195,7 @@ struct TTNN : Ops {
         Tensor t = put_weight(w, N, k, b.w.dtype() == ttnn::DataType::BFLOAT4_B ? "bfp4" : "bfp8");
         ttnn::fill_cache(b.w, ttnn::reshape(tt(t), shp({1, 1, k, N})), slot);
     }
+    bool takes_tiles() const override { return true; }
     void bank_write_tiles(Tensor& bank, int slot, const void* tiles, size_t bytes) override {
         // the slot's pages as they are: tstore_expert_tt already wrote TT's bfp tiles, so no packing on the host,
         // only the PCIe copy (on command queue 1, next to the decode on queue 0)

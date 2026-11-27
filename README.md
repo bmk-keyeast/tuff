@@ -411,8 +411,8 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 - [x] Prefill on the card: passes of 512 tokens, attention for all of them at once (masked), last DeltaNet state only
 - [ ] Prefill experts: stream them to the card in layer order instead of computing the cold ones on the CPU
 - [ ] N-gram table on NVMe with prefetch
-- [x] C++ engine draft (`engine/`): == the Python card code on the CPU reference; tt-metal backend written, not built yet
-- [ ] C++ engine on the card: build `ttnn_ops.cpp` against tt-metal, then MTP and the GPU split in C++
+- [x] C++ engine (`engine/`): card code, MTP, card + GPU split, prefill, snapshot reader, CUDA backend; == the Python card code
+- [ ] C++ engine on the card: build `ttnn_ops.cpp` against tt-metal and run `tuff_engine test` there
 - [ ] DeepSeek-V4.1-Flash-1017 on several cards: routing measured first, see [Later](#later)
 - [ ] AVX-512 kernels for the 8259CL, only if `bench/host.sh` shows cold experts compute-bound (on paper AVX2 already
       outruns DRAM on both hosts: ~10 GB/s per core)
@@ -422,13 +422,32 @@ python trace.py --tokens 1024 --layers 48 && python trace.py analyze basalt.prof
 
 ### A C++ host loop
 
-**Started: [`engine/`](engine/).** The decode step in C++ (`qfn.cpp`, device/qfn.py's Card method for method) over an
-op interface (`ops.h`) with two backends: a float32 CPU reference (`cpu_ops.cpp`) and a tt-metal one (`ttnn_ops.cpp`,
-a draft built only on the box, with `bank_write_tiles` writing an expert's TT tiles straight into its slot). It links
-libtuff's cache (tcache) and store (tstore + moe_forward_n) directly. [`engine/test_engine.py`](engine/test_engine.py)
-(CI) runs it on the tiny random QFN against the Python card code: the same mixer outputs over 40 steps (2.2e-6), the
-same expert-slot hits (342/1280) and the same greedy tokens; with cold experts from a BFP4 store, close (median 5.6e-2).
-Not there yet: the MTP drafter and the card + GPU split in C++, BFP rounding in the CPU reference.
+**Done: [`engine/`](engine/).** The whole decode path is C++ now, over an op interface (`ops.h`) with three
+backends: a float32 CPU reference (`cpu_ops.cpp`), the card through tt-metal (`ttnn_ops.cpp`: traces, `sparse_matmul`
+over expert banks, `bank_write_tiles` writing an expert's TT tiles straight into its slot) and the 4060 Ti
+(`cuda_ops.cu`: BFP weights through `bfp_cuda.cu`, slots filled from the store's BFP as it is). `qfn.cpp` holds the
+card code (traced segments, the MoE write carried into the next segment, prefill in passes with attention for all
+tokens at once), QFN's MTP drafter (one-pass catch-up, optional draft vocabulary) and the card + GPU split;
+`weights.cpp` reads a Hugging Face snapshot directly (safetensors mmap'ed, bf16 widened per use, experts and table rows
+read without loading the whole tensor, the N-gram head sizes rebuilt as transformers does); libtuff's cache and store
+are linked in. `tuff_engine run --model <snapshot> --store <experts> --ids "..." [--mtp 2] [--ttnn] [--gpu]` decodes
+the real model (token ids in and out: `engine/tok.py` converts text).
+
+[`engine/test_engine.py`](engine/test_engine.py) (CI) checks it against the Python card code on the tiny random QFN:
+
+| check | result |
+|---|---|
+| single steps, mixer outputs | 2.2e-6, same expert-slot hits (342/1280) |
+| greedy decoding | same tokens |
+| a 27-token prefill pass, then steps | 4.4e-6 |
+| MTP speculative, also over a draft vocabulary | same tokens, same number of steps, == greedy |
+| card + GPU split at 50% and 30% | 2e-6 / 3e-6 against Python's split; speculative on it == greedy |
+| the same model read from a safetensors snapshot (sharded N-gram table) | 2.2e-6; MTP == greedy |
+| cold experts from the BFP4 store | median 5.6e-2 (BFP4 rounding) |
+
+Not run yet: `ttnn_ops.cpp` and `cuda_ops.cu` (no card or GPU in CI; the CUDA one compiles there). What stays in
+Python is not the engine: the reference and test oracles (ref.py, device/), the analysis (plan.py, trace.py) and the
+tokenizer.
 
 
 The Python card code is the specification: it is what CI checks against ref.py and transformers, and what goes on the
@@ -554,7 +573,7 @@ reporting set to "OS First" in the BIOS.
   4060 Ti 쪽은 BFP 가중치를 그대로 GPU에 두고 CUDA 커널로 계산(`ops.CUDA`). 카드·GPU가 없어 아직 미실행
 - **카드 첫 실행 검사**(`device/test_ops.py`): 연산 하나하나를 CPU와 비교한 뒤, 카드 코드 전체(trace, MTP 포함)를 CPU 결과와 비교
 
-- **C++ 엔진 초안**(`engine/`): 디코딩 루프를 C++로 옮김. CPU 참조 백엔드에서 Python 카드 코드와 결과가 같음(40스텝 2.2e-6, 슬롯 적중·greedy 토큰 동일, CI 확인). 카드용 tt-metal 백엔드는 초안(전문가 타일을 재포장 없이 슬롯에 바로 쓰는 경로 포함), 카드에서 빌드 필요
+- **C++ 엔진**(`engine/`): 디코딩 경로 전체를 C++로 옮김. 카드 코드(trace 구간, prefill), MTP 초안 모델, 카드+4060 Ti 분할, HF 체크포인트 직접 읽기(safetensors), CUDA 백엔드까지. CPU 참조 백엔드에서 Python 카드 코드와 모든 경우에 결과가 같음(CI). 카드(tt-metal)·GPU(CUDA) 백엔드는 기기가 없어 아직 미실행. Python에 남은 건 검증용 기준 구현·분석 도구·토크나이저뿐
 
 **향후 계획 (README의 Later):** ① 카드에서 Python 버전을 검증한 뒤 디코딩 루프를 C++로 옮기기(호스트 제어 시간 감소, 전문가 타일을 재포장 없이 바로 쓰기, 복사 전용 스레드). ② DeepSeek-V4.1-Flash-1017을 카드 여러 장으로: QFN과 구조가 비슷해(하이퍼커넥션, N-gram 메모리, 인덱서 어텐션, MTP) 대부분 재사용 가능. 먼저 GitHub Actions에서 라우팅을 측정해 캐시 적중률을 확인하고, 그걸로 카드 수(1장 9~16 t/s, 4장 21~53 t/s 예측)와 호스트 램(384GB 이상, 6채널)을 정함.
 

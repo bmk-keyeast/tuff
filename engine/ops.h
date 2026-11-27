@@ -2,6 +2,7 @@
 //
 //   cpu_ops()    float32 reference on the host (cpu_ops.cpp). CI runs the engine on it against the Python card code.
 //   ttnn_ops()   a Tenstorrent card through tt-metal's C++ API (ttnn_ops.cpp, built with TUFF_TTNN=1 on the box).
+//   cuda_ops()   an NVIDIA GPU, the 4060 Ti next to the card (cuda_ops.cu, TUFF_CUDA=1): BFP weights stay BFP.
 //
 // A weight W [out, in] (torch layout) is uploaded as W^T [in, out]; linear(x, w) = x @ W^T. Tensors are handles: the
 // backend owns what `impl` points to.
@@ -72,6 +73,12 @@ struct Ops {
     virtual Tensor bank(int n, int k, int N, const std::string& fmt) = 0;
     virtual void bank_write(Tensor& bank, int slot, const float* w, int N, int k) = 0;     // W [N][k], packed here
     // a slot from TT tiles as tstore_expert_tt gives them (no repacking): the reason the engine is C++
+    virtual bool takes_tiles() const { return false; }
+    // a slot from the host BFP layout (kernels/bfp.h) as the store maps it: the GPU's kernels read it as is
+    virtual bool takes_bfp() const { return false; }
+    virtual void bank_write_bfp(Tensor&, int, const uint8_t*, const uint8_t*, int, int, int) {
+        throw std::runtime_error("bank_write_bfp: not on this backend");
+    }
     virtual void bank_write_tiles(Tensor&, int, const void*, size_t) {
         throw std::runtime_error("bank_write_tiles: not on this backend");
     }
@@ -88,6 +95,9 @@ struct Ops {
 std::unique_ptr<Ops> cpu_ops();
 #ifdef TUFF_TTNN
 std::unique_ptr<Ops> ttnn_ops(int device_id, size_t trace_region_bytes);
+#endif
+#ifdef TUFF_CUDA
+std::unique_ptr<Ops> cuda_ops();                      // an NVIDIA GPU (cuda_ops.cu)
 #endif
 
 }  // namespace tuff

@@ -50,6 +50,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: apt-get update -qq && apt-get install -y -qq make > /dev/null
       - run: make -C kernels test_cuda libtuff_cuda.so
+      - run: make -C engine TUFF_CUDA=1   # the C++ engine with its GPU backend (compile only)
 
   hf-checks:    # against transformers' own Qwen4Exp code: exact card/GPU split, numpy decode reference
     runs-on: ubuntu-latest
